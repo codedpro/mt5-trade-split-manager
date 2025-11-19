@@ -1,11 +1,30 @@
-# MT5 Bulk Order Manager with Split TP & Smart Trailing Stop
+# MT5 Trade Split Manager 🤖
 
 [![MetaTrader 5](https://img.shields.io/badge/MetaTrader-5-blue.svg)](https://www.metatrader5.com/)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109.0-green.svg)](https://fastapi.tiangolo.com/)
+[![AI Agent Friendly](https://img.shields.io/badge/AI%20Agent-Friendly-brightgreen.svg)](https://claude.ai)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Professional-grade MetaTrader 5 Expert Advisor with intelligent order splitting, automatic trailing stop loss, and REST API integration for Gold (XAUUSD) and Silver (XAGUSD) trading.**
+**🤖 AI-Agent Friendly** | **Professional-grade MetaTrader 5 Expert Advisor with intelligent order splitting, automatic trailing stop loss, and REST API integration for Gold (XAUUSD) and Silver (XAGUSD) trading. Built for seamless integration with Claude AI and other AI agents.**
+
+## 🤖 Why AI-Agent Friendly?
+
+This system is designed for seamless integration with AI agents like **Claude AI**, **ChatGPT**, and other LLMs:
+
+- 🔌 **REST API First** - Simple JSON endpoints that AI agents can easily call
+- 📝 **Natural Language Processing** - AI agents can parse trading signals and convert to API calls
+- 🔄 **Stateless Design** - Each API call is independent, perfect for AI workflows
+- 📊 **Structured Responses** - JSON responses that AI can parse and act upon
+- 🛡️ **Safe Defaults** - Smart order type detection prevents common AI mistakes
+- 📚 **Well-Documented** - Complete API docs for AI agent training/prompts
+
+**Example AI Agent Workflow:**
+```
+User: "Buy Gold at 4100 with 30-pip TPs"
+AI Agent: Parses signal → Calls REST API → Monitors response
+System: Splits order → Manages positions → Returns status
+```
 
 ## 🚀 Key Features
 
@@ -19,6 +38,7 @@
 - ✅ **Position Recovery** - Rebuilds tracking from existing orders on restart
 - ✅ **Multi-Symbol Support** - Optimized for Gold (XAUUSD) and Silver (XAGUSD)
 - ✅ **Risk Management** - Daily loss limits, max positions, spread checks
+- ✅ **AI Agent Ready** - Perfect for Claude AI, ChatGPT, and automation workflows
 
 ## 📋 Table of Contents
 
