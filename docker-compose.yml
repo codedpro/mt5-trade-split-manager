@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  signal-server:
+    build: .
+    container_name: mt5-signal-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./server.py:/app/server.py
+      - ./config.json:/app/config.json
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    network_mode: "host"  # Required for ZeroMQ to communicate with MT5 on localhost
+    restart: unless-stopped

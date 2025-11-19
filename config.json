@@ -1,0 +1,30 @@
+{
+  "mt5": {
+    "zmq_host": "tcp://localhost",
+    "zmq_port": 5555,
+    "magic_number": 20250117,
+    "default_lot_size": 0.1,
+    "max_spread_pips": 10,
+    "slippage_pips": 3
+  },
+  "symbols": {
+    "gold": "XAUUSD",
+    "silver": "XAGUSD"
+  },
+  "risk_management": {
+    "max_daily_loss_percent": 5.0,
+    "max_positions": 10,
+    "max_lot_per_trade": 1.0,
+    "min_lot_per_trade": 0.01
+  },
+  "take_profit": {
+    "levels": 5,
+    "pip_step": 30,
+    "partial_close_percent": 20.0
+  },
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0",
+    "debug": true
+  }
+}
