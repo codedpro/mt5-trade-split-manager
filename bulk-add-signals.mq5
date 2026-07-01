@@ -29,6 +29,8 @@ CPositionInfo position;
 CAccountInfo account;
 
 double dailyStartBalance = 0;
+datetime dailyStartDay = 0;    // Start of the current trading day (for daily loss reset)
+int g_groupCounter = 0;        // Monotonic counter to keep group IDs unique
 
 //--- Structures
 struct TradeCommand {
@@ -46,6 +48,7 @@ struct TradeCommand {
 struct SplitOrderGroup {
     string groupId;           // Unique identifier for the group (based on entry price + symbol)
     ulong tickets[5];         // Tickets for all 5 split orders
+    double tp_prices[5];      // Actual TP price placed for each split (source of truth)
     bool tp2_reached;         // Flag to track if TP2 was reached
     double entry_price;       // Entry price
     string symbol;            // Symbol
@@ -67,8 +70,9 @@ int OnInit()
     trade.SetTypeFilling(ORDER_FILLING_RETURN);  // Changed from FOK to RETURN for better broker compatibility
     trade.SetAsyncMode(false);
 
-    // Store starting balance
+    // Store starting balance and current trading day (for daily loss reset)
     dailyStartBalance = account.Balance();
+    dailyStartDay = TimeCurrent() - (TimeCurrent() % 86400);
 
     // Recover existing positions for split order tracking
     RecoverSplitOrders();
@@ -348,6 +352,26 @@ double ExtractDouble(string json, string key)
 }
 
 //+------------------------------------------------------------------+
+//| Parse an order-type string into an ENUM (WRONG_VALUE if unknown)  |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE ParseOrderType(string s)
+{
+    if(s == "BUY_STOP")   return ORDER_TYPE_BUY_STOP;
+    if(s == "SELL_STOP")  return ORDER_TYPE_SELL_STOP;
+    if(s == "BUY_LIMIT")  return ORDER_TYPE_BUY_LIMIT;
+    if(s == "SELL_LIMIT") return ORDER_TYPE_SELL_LIMIT;
+    return WRONG_VALUE;
+}
+
+//+------------------------------------------------------------------+
+//| Is this a buy-side order type?                                    |
+//+------------------------------------------------------------------+
+bool IsBuyType(ENUM_ORDER_TYPE t)
+{
+    return (t == ORDER_TYPE_BUY_STOP || t == ORDER_TYPE_BUY_LIMIT);
+}
+
+//+------------------------------------------------------------------+
 //| Validate command                                                   |
 //+------------------------------------------------------------------+
 bool ValidateCommand(TradeCommand &cmd)
@@ -387,29 +411,50 @@ bool ValidateCommand(TradeCommand &cmd)
 //+------------------------------------------------------------------+
 ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 {
-    // Smart order type detection based on price vs market
-    double currentPrice = SymbolInfoDouble(cmd.symbol, SYMBOL_ASK);
-    ENUM_ORDER_TYPE orderType;
-
-    if(cmd.order_type == "BUY_STOP")
+    // Parse the requested order type explicitly. We do NOT silently convert a
+    // STOP into a LIMIT (or vice-versa): that would reverse the trade's intent
+    // (breakout vs. pullback entry). Ambiguous requests are rejected instead.
+    ENUM_ORDER_TYPE orderType = ParseOrderType(cmd.order_type);
+    if(orderType == WRONG_VALUE)
     {
-        // BUY STOP must be above market, BUY LIMIT below market
-        orderType = (cmd.price > currentPrice) ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_BUY_LIMIT;
-    }
-    else  // SELL_STOP
-    {
-        // SELL STOP must be below market, SELL LIMIT above market
-        orderType = (cmd.price < currentPrice) ? ORDER_TYPE_SELL_STOP : ORDER_TYPE_SELL_LIMIT;
+        errorMsg = "Unknown order_type '" + cmd.order_type + "' (expected BUY_STOP/SELL_STOP/BUY_LIMIT/SELL_LIMIT)";
+        Print("❌ ", errorMsg);
+        return 0;
     }
 
-    string orderTypeStr = "";
-    if(orderType == ORDER_TYPE_BUY_STOP) orderTypeStr = "BUY_STOP";
-    else if(orderType == ORDER_TYPE_BUY_LIMIT) orderTypeStr = "BUY_LIMIT";
-    else if(orderType == ORDER_TYPE_SELL_STOP) orderTypeStr = "SELL_STOP";
-    else if(orderType == ORDER_TYPE_SELL_LIMIT) orderTypeStr = "SELL_LIMIT";
+    double ask = SymbolInfoDouble(cmd.symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(cmd.symbol, SYMBOL_BID);
+    bool isBuy = IsBuyType(orderType);
 
-    Print("Executing ", cmd.order_type, " → ", orderTypeStr, " order on ", cmd.symbol);
-    Print("Current price: ", currentPrice, " | Order price: ", cmd.price, " | SL: ", cmd.sl, " | Total Lot: ", cmd.lot_size);
+    // Reject orders whose price is on the wrong side of the market for the
+    // requested type, rather than quietly re-interpreting them.
+    string sideError = "";
+    if(orderType == ORDER_TYPE_BUY_STOP   && cmd.price <= ask) sideError = "BUY_STOP requires price ABOVE ask - use BUY_LIMIT for entries below market";
+    if(orderType == ORDER_TYPE_BUY_LIMIT  && cmd.price >= ask) sideError = "BUY_LIMIT requires price BELOW ask - use BUY_STOP for entries above market";
+    if(orderType == ORDER_TYPE_SELL_STOP  && cmd.price >= bid) sideError = "SELL_STOP requires price BELOW bid - use SELL_LIMIT for entries above market";
+    if(orderType == ORDER_TYPE_SELL_LIMIT && cmd.price <= bid) sideError = "SELL_LIMIT requires price ABOVE bid - use SELL_STOP for entries below market";
+    if(sideError != "")
+    {
+        errorMsg = StringFormat("%s (ask=%.5f bid=%.5f price=%.5f)", sideError, ask, bid, cmd.price);
+        Print("❌ Refusing order: ", errorMsg);
+        return 0;
+    }
+
+    // Validate SL / TP are on the correct side of the entry for the direction.
+    if(cmd.sl > 0)
+    {
+        if(isBuy && cmd.sl >= cmd.price)  { errorMsg = "BUY stop-loss must be below entry price";  Print("❌ ", errorMsg); return 0; }
+        if(!isBuy && cmd.sl <= cmd.price) { errorMsg = "SELL stop-loss must be above entry price"; Print("❌ ", errorMsg); return 0; }
+    }
+    for(int t = 0; t < 5; t++)
+    {
+        if(cmd.tp_levels[t] <= 0)                       { errorMsg = StringFormat("TP%d is missing or invalid", t+1);     Print("❌ ", errorMsg); return 0; }
+        if(isBuy && cmd.tp_levels[t] <= cmd.price)      { errorMsg = StringFormat("BUY TP%d must be above entry price", t+1);  Print("❌ ", errorMsg); return 0; }
+        if(!isBuy && cmd.tp_levels[t] >= cmd.price)     { errorMsg = StringFormat("SELL TP%d must be below entry price", t+1); Print("❌ ", errorMsg); return 0; }
+    }
+
+    Print("Executing ", cmd.order_type, " order on ", cmd.symbol);
+    Print("Ask: ", ask, " | Bid: ", bid, " | Order price: ", cmd.price, " | SL: ", cmd.sl, " | Total Lot: ", cmd.lot_size);
     Print("Will split into 5 orders: TP1=60%, TP2-TP5=10% each");
 
     // Calculate volume splits
@@ -422,8 +467,11 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     volumes[3] = NormalizeDouble(cmd.lot_size * 0.10, 2);  // 10% for TP4
     volumes[4] = NormalizeDouble(cmd.lot_size * 0.10, 2);  // 10% for TP5
 
-    // Create group ID
-    string groupId = StringFormat("%s_%.3f_%d", cmd.symbol, cmd.price, (int)TimeLocal());
+    // Create a compact, unique group ID. Kept short so it fits inside the MT5
+    // order comment (brokers truncate long comments, which used to silently
+    // break recovery). The monotonic counter guarantees uniqueness per second.
+    g_groupCounter++;
+    string groupId = StringFormat("SM%d_%d", (int)TimeLocal(), g_groupCounter);
 
     // Create split order group
     int groupIndex = ArraySize(orderGroups);
@@ -433,6 +481,8 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     orderGroups[groupIndex].entry_price = cmd.price;
     orderGroups[groupIndex].symbol = cmd.symbol;
     orderGroups[groupIndex].order_type = orderType;
+    for(int t = 0; t < 5; t++)
+        orderGroups[groupIndex].tp_prices[t] = cmd.tp_levels[t];
 
     // Place 5 separate orders
     int successCount = 0;
@@ -440,7 +490,9 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 
     for(int i = 0; i < 5; i++)
     {
-        string orderComment = StringFormat("%s|GROUP:%s|TP:%d", cmd.comment, groupId, i+1);
+        // Functional comment only: "<groupId>#<tpIndex>". No free-text prefix,
+        // so the group/index tokens can't be pushed out by comment truncation.
+        string orderComment = StringFormat("%s#%d", groupId, i+1);
 
         bool success = trade.OrderOpen(
             cmd.symbol,
@@ -482,8 +534,8 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
         return 0;
     }
 
-    // Draw TP levels on chart (once for the group)
-    DrawTPLevels(groupId, cmd.symbol, cmd.price, orderType);
+    // Draw TP levels on chart (once for the group) using the ACTUAL TP prices
+    DrawTPLevels(groupId, cmd.symbol, cmd.price, orderGroups[groupIndex].tp_prices);
 
     Print("✅ Order group placed: ", successCount, "/5 orders successful");
     return firstTicket;  // Return first ticket as reference
@@ -493,22 +545,16 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 //+------------------------------------------------------------------+
 //| Draw TP levels on chart                                           |
 //+------------------------------------------------------------------+
-void DrawTPLevels(string groupId, string symbol, double entryPrice, ENUM_ORDER_TYPE orderType)
+void DrawTPLevels(string groupId, string symbol, double entryPrice, double &tpPrices[])
 {
-    // Calculate TP levels: TP1=15 pips, then +30 pip intervals
-    double pipValue = (symbol == "XAGUSD") ? 0.01 : 0.10;  // Silver: 0.01, Gold: 0.10
-    int direction = (orderType == ORDER_TYPE_BUY_STOP) ? 1 : -1;
-
     color levelColors[5] = {clrLime, clrGreen, clrYellow, clrOrange, clrRed};
 
     string percentages[5] = {"60%", "10%", "10%", "10%", "10%"};
 
-    // TP levels: 15, 45, 75, 105, 135 pips
-    int tpPips[5] = {15, 45, 75, 105, 135};
-
     for(int i = 0; i < 5; i++)
     {
-        double tpPrice = entryPrice + (direction * tpPips[i] * pipValue);
+        double tpPrice = tpPrices[i];
+        if(tpPrice <= 0) continue;  // TP already closed / unknown - skip drawing
 
         // Create horizontal line
         string lineName = StringFormat("TP%d_Line_%s", i+1, groupId);
@@ -616,14 +662,11 @@ void CheckTP2ForTrailingSL()
             // TP2 was hit! Move SL to TP1 for all remaining positions
             Print("🎯 TP2 reached for group ", orderGroups[i].groupId, " - Moving SL to TP1 for all remaining positions");
 
-            double entry = orderGroups[i].entry_price;
-            string symbol = orderGroups[i].symbol;
-            ENUM_ORDER_TYPE orderType = orderGroups[i].order_type;
-
-            // Calculate TP1 price (15 pips from entry)
-            double pipValue = (symbol == "XAGUSD") ? 0.01 : 0.10;  // Silver: 0.01, Gold: 0.10
-            int direction = (orderType == ORDER_TYPE_BUY_STOP) ? 1 : -1;
-            double newSL = entry + (direction * 15 * pipValue);
+            // Use the ACTUAL TP1 price that was placed - not a hardcoded pip
+            // offset that may not match the caller's TP ladder. Fall back to
+            // breakeven (entry) if TP1's price is unknown after recovery.
+            double newSL = orderGroups[i].tp_prices[0];
+            if(newSL <= 0) newSL = orderGroups[i].entry_price;
 
             // Update SL for all remaining positions (TP3, TP4, TP5)
             int movedCount = 0;
@@ -714,10 +757,76 @@ int CountOpenPositions()
 //+------------------------------------------------------------------+
 bool CheckDailyLossLimit()
 {
-    double loss = dailyStartBalance - account.Balance();
+    // Reset the daily baseline when a new calendar day starts.
+    datetime today = TimeCurrent() - (TimeCurrent() % 86400);
+    if(today != dailyStartDay)
+    {
+        dailyStartDay = today;
+        dailyStartBalance = account.Balance();
+    }
+
+    if(dailyStartBalance <= 0) return true;
+
+    // Measure against equity so floating (open) losses count too - more
+    // conservative than balance, which ignores open positions.
+    double loss = dailyStartBalance - account.Equity();
     double lossPercent = (loss / dailyStartBalance) * 100.0;
 
     return (lossPercent < MaxDailyLossPercent);
+}
+
+//+------------------------------------------------------------------+
+//| Parse a split-order comment into (groupId, tpLevel).             |
+//| Supports the new "<groupId>#<idx>" format and the legacy         |
+//| "...|GROUP:<groupId>|TP:<idx>" format for in-flight orders.      |
+//+------------------------------------------------------------------+
+bool ParseGroupComment(string comment, string &groupId, int &tpLevel)
+{
+    // New compact format: "<groupId>#<idx>"
+    int hashPos = StringFind(comment, "#");
+    if(hashPos > 0)
+    {
+        groupId = StringSubstr(comment, 0, hashPos);
+        tpLevel = (int)StringToInteger(StringSubstr(comment, hashPos + 1, 1));
+        if(tpLevel >= 1 && tpLevel <= 5) return true;
+    }
+
+    // Legacy format: "...|GROUP:<groupId>|TP:<idx>"
+    int gPos = StringFind(comment, "|GROUP:");
+    if(gPos >= 0)
+    {
+        int tpPos = StringFind(comment, "|TP:", gPos);
+        if(tpPos >= 0)
+        {
+            groupId = StringSubstr(comment, gPos + 7, tpPos - gPos - 7);
+            tpLevel = (int)StringToInteger(StringSubstr(comment, tpPos + 4, 1));
+            if(tpLevel >= 1 && tpLevel <= 5) return true;
+        }
+    }
+
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Find the group with this id, or create a fresh (empty) one.      |
+//+------------------------------------------------------------------+
+int FindOrCreateGroup(string groupId)
+{
+    for(int i = 0; i < ArraySize(orderGroups); i++)
+        if(orderGroups[i].groupId == groupId) return i;
+
+    int idx = ArraySize(orderGroups);
+    ArrayResize(orderGroups, idx + 1);
+    orderGroups[idx].groupId = groupId;
+    orderGroups[idx].tp2_reached = false;
+    orderGroups[idx].entry_price = 0;
+    orderGroups[idx].symbol = "";
+    for(int t = 0; t < 5; t++)
+    {
+        orderGroups[idx].tickets[t] = 0;
+        orderGroups[idx].tp_prices[t] = 0;
+    }
+    return idx;
 }
 
 //+------------------------------------------------------------------+
@@ -729,206 +838,86 @@ void RecoverSplitOrders()
 
     ArrayResize(orderGroups, 0);  // Clear array first
 
-    int totalPositions = PositionsTotal();
-    int totalOrders = OrdersTotal();
+    Print("Total open positions found: ", PositionsTotal());
+    Print("Total pending orders found: ", OrdersTotal());
 
-    Print("Total open positions found: ", totalPositions);
-    Print("Total pending orders found: ", totalOrders);
-
-    // Build a map of group IDs from existing positions/orders
-    string groupIds[];
-    int groupCount = 0;
-
-    // Scan all positions and orders to find unique group IDs
+    // Rebuild groups directly from open positions. The actual TP price of each
+    // split is read back from the live order/position, so trailing and safe
+    // shutdown stay consistent with what was really placed.
     for(int i = 0; i < PositionsTotal(); i++)
     {
         if(position.SelectByIndex(i) && position.Magic() == MagicNumber)
         {
-            string comment = position.Comment();
-            int groupPos = StringFind(comment, "|GROUP:");
-            if(groupPos >= 0)
+            string groupId; int tpLevel;
+            if(!ParseGroupComment(position.Comment(), groupId, tpLevel)) continue;
+
+            int gi = FindOrCreateGroup(groupId);
+            orderGroups[gi].tickets[tpLevel - 1]   = position.Ticket();
+            orderGroups[gi].tp_prices[tpLevel - 1] = position.TakeProfit();
+
+            if(orderGroups[gi].entry_price == 0)
             {
-                int tpPos = StringFind(comment, "|TP:", groupPos);
-                if(tpPos >= 0)
-                {
-                    string groupId = StringSubstr(comment, groupPos + 7, tpPos - groupPos - 7);
-
-                    // Check if we already have this group
-                    bool found = false;
-                    for(int j = 0; j < groupCount; j++)
-                    {
-                        if(groupIds[j] == groupId)
-                        {
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    if(!found)
-                    {
-                        ArrayResize(groupIds, groupCount + 1);
-                        groupIds[groupCount] = groupId;
-                        groupCount++;
-                    }
-                }
+                orderGroups[gi].entry_price = position.PriceOpen();
+                orderGroups[gi].symbol      = position.Symbol();
+                ENUM_POSITION_TYPE posType  = (ENUM_POSITION_TYPE)position.Type();
+                orderGroups[gi].order_type  = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
             }
+
+            Print("   ✅ Found position TP", tpLevel, " - Ticket #", position.Ticket());
         }
     }
 
-    // Also check pending orders
+    // Then fold in pending orders for the same groups.
     for(int i = 0; i < OrdersTotal(); i++)
     {
         ulong ticket = OrderGetTicket(i);
         if(ticket > 0 && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
         {
-            string comment = OrderGetString(ORDER_COMMENT);
-            int groupPos = StringFind(comment, "|GROUP:");
-            if(groupPos >= 0)
+            string groupId; int tpLevel;
+            if(!ParseGroupComment(OrderGetString(ORDER_COMMENT), groupId, tpLevel)) continue;
+
+            int gi = FindOrCreateGroup(groupId);
+            orderGroups[gi].tickets[tpLevel - 1]   = ticket;
+            orderGroups[gi].tp_prices[tpLevel - 1] = OrderGetDouble(ORDER_TP);
+
+            if(orderGroups[gi].entry_price == 0)
             {
-                int tpPos = StringFind(comment, "|TP:", groupPos);
-                if(tpPos >= 0)
-                {
-                    string groupId = StringSubstr(comment, groupPos + 7, tpPos - groupPos - 7);
-
-                    // Check if we already have this group
-                    bool found = false;
-                    for(int j = 0; j < groupCount; j++)
-                    {
-                        if(groupIds[j] == groupId)
-                        {
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    if(!found)
-                    {
-                        ArrayResize(groupIds, groupCount + 1);
-                        groupIds[groupCount] = groupId;
-                        groupCount++;
-                    }
-                }
+                orderGroups[gi].entry_price = OrderGetDouble(ORDER_PRICE_OPEN);
+                orderGroups[gi].symbol      = OrderGetString(ORDER_SYMBOL);
+                orderGroups[gi].order_type  = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
             }
+
+            Print("   📋 Found pending order TP", tpLevel, " - Ticket #", ticket);
         }
     }
 
+    int groupCount = ArraySize(orderGroups);
     Print("Found ", groupCount, " unique order group(s) to recover");
 
-    // Rebuild each group
+    // Post-process: infer TP2-reached state and redraw visuals.
     for(int g = 0; g < groupCount; g++)
     {
-        string groupId = groupIds[g];
-        Print("🔄 Recovering group: ", groupId);
-
-        int groupIndex = ArraySize(orderGroups);
-        ArrayResize(orderGroups, groupIndex + 1);
-
-        orderGroups[groupIndex].groupId = groupId;
-        orderGroups[groupIndex].tp2_reached = false;
-
-        // Initialize tickets to 0
-        for(int t = 0; t < 5; t++)
+        // TP2 was already hit if its ticket is gone but a later TP survives.
+        if(orderGroups[g].tickets[1] == 0 &&
+           (orderGroups[g].tickets[2] > 0 ||
+            orderGroups[g].tickets[3] > 0 ||
+            orderGroups[g].tickets[4] > 0))
         {
-            orderGroups[groupIndex].tickets[t] = 0;
+            orderGroups[g].tp2_reached = true;
+            Print("   🎯 TP2 already reached for group ", orderGroups[g].groupId);
         }
 
-        // Find all tickets for this group (from positions)
-        for(int i = 0; i < PositionsTotal(); i++)
+        if(orderGroups[g].entry_price > 0)
         {
-            if(position.SelectByIndex(i) && position.Magic() == MagicNumber)
-            {
-                string comment = position.Comment();
-                if(StringFind(comment, "|GROUP:" + groupId) >= 0)
-                {
-                    // Extract TP level
-                    int tpPos = StringFind(comment, "|TP:");
-                    if(tpPos >= 0)
-                    {
-                        string tpStr = StringSubstr(comment, tpPos + 4, 1);
-                        int tpLevel = (int)StringToInteger(tpStr);
+            DrawTPLevels(orderGroups[g].groupId, orderGroups[g].symbol,
+                         orderGroups[g].entry_price, orderGroups[g].tp_prices);
 
-                        if(tpLevel >= 1 && tpLevel <= 5)
-                        {
-                            orderGroups[groupIndex].tickets[tpLevel - 1] = position.Ticket();
-
-                            // Store metadata from first position found
-                            if(orderGroups[groupIndex].entry_price == 0)
-                            {
-                                orderGroups[groupIndex].entry_price = position.PriceOpen();
-                                orderGroups[groupIndex].symbol = position.Symbol();
-                                ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)position.Type();
-                                orderGroups[groupIndex].order_type = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
-                            }
-
-                            Print("   ✅ Found position TP", tpLevel, " - Ticket #", position.Ticket());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Find all tickets for this group (from pending orders)
-        for(int i = 0; i < OrdersTotal(); i++)
-        {
-            ulong ticket = OrderGetTicket(i);
-            if(ticket > 0 && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
-            {
-                string comment = OrderGetString(ORDER_COMMENT);
-                if(StringFind(comment, "|GROUP:" + groupId) >= 0)
-                {
-                    // Extract TP level
-                    int tpPos = StringFind(comment, "|TP:");
-                    if(tpPos >= 0)
-                    {
-                        string tpStr = StringSubstr(comment, tpPos + 4, 1);
-                        int tpLevel = (int)StringToInteger(tpStr);
-
-                        if(tpLevel >= 1 && tpLevel <= 5)
-                        {
-                            orderGroups[groupIndex].tickets[tpLevel - 1] = ticket;
-
-                            // Store metadata from first order found
-                            if(orderGroups[groupIndex].entry_price == 0)
-                            {
-                                orderGroups[groupIndex].entry_price = OrderGetDouble(ORDER_PRICE_OPEN);
-                                orderGroups[groupIndex].symbol = OrderGetString(ORDER_SYMBOL);
-                                orderGroups[groupIndex].order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-                            }
-
-                            Print("   📋 Found pending order TP", tpLevel, " - Ticket #", ticket);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check if TP2 was already hit (TP2 position doesn't exist, but TP3+ do)
-        if(orderGroups[groupIndex].tickets[1] == 0 &&
-           (orderGroups[groupIndex].tickets[2] > 0 ||
-            orderGroups[groupIndex].tickets[3] > 0 ||
-            orderGroups[groupIndex].tickets[4] > 0))
-        {
-            orderGroups[groupIndex].tp2_reached = true;
-            Print("   🎯 TP2 already reached for this group");
-        }
-
-        // Redraw visuals if we have valid metadata
-        if(orderGroups[groupIndex].entry_price > 0)
-        {
-            DrawTPLevels(groupId, orderGroups[groupIndex].symbol,
-                        orderGroups[groupIndex].entry_price,
-                        orderGroups[groupIndex].order_type);
-
-            // Mark closed TPs as gray
+            // Mark already-closed TPs as gray.
             for(int t = 0; t < 5; t++)
-            {
-                if(orderGroups[groupIndex].tickets[t] == 0)
-                {
-                    UpdateTPLevelClosed(groupId, t + 1);
-                }
-            }
+                if(orderGroups[g].tickets[t] == 0)
+                    UpdateTPLevelClosed(orderGroups[g].groupId, t + 1);
 
-            Print("✅ Group ", groupId, " recovered successfully");
+            Print("✅ Group ", orderGroups[g].groupId, " recovered successfully");
         }
     }
 
@@ -1064,16 +1053,8 @@ string HandleClosePosition(string commandJson)
     string groupId = "";
     if(PositionSelectByTicket(ticket))
     {
-        string comment = PositionGetString(POSITION_COMMENT);
-        int groupPos = StringFind(comment, "|GROUP:");
-        if(groupPos >= 0)
-        {
-            int tpPos = StringFind(comment, "|TP:", groupPos);
-            if(tpPos >= 0)
-            {
-                groupId = StringSubstr(comment, groupPos + 7, tpPos - groupPos - 7);
-            }
-        }
+        int tpLevel;
+        ParseGroupComment(PositionGetString(POSITION_COMMENT), groupId, tpLevel);
     }
 
     if(trade.PositionClose(ticket))
@@ -1143,13 +1124,14 @@ string HandleSafeShutdown()
         Print("🔄 Processing group: ", orderGroups[i].groupId);
 
         double entry = orderGroups[i].entry_price;
-        string symbol = orderGroups[i].symbol;
-        ENUM_ORDER_TYPE orderType = orderGroups[i].order_type;
 
-        // Calculate TP2 price (45 pips from entry)
-        double pipValue = (symbol == "XAGUSD") ? 0.01 : 0.10;  // Silver: 0.01, Gold: 0.10
-        int direction = (orderType == ORDER_TYPE_BUY_STOP) ? 1 : -1;
-        double tp2Price = entry + (direction * 45 * pipValue);
+        // Consolidate remaining TPs to the ACTUAL TP2 price that was placed.
+        double tp2Price = orderGroups[i].tp_prices[1];
+        if(tp2Price <= 0)
+        {
+            Print("⚠️  Skipping group ", orderGroups[i].groupId, " - TP2 price unknown");
+            continue;
+        }
 
         int modifiedInGroup = 0;
 

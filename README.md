@@ -34,7 +34,7 @@ System: Splits order → Manages positions → Returns status
 - ✅ **Safe Shutdown Mode** - Protects positions when EA is offline
 - ✅ **REST API Integration** - FastAPI server for external signal processing
 - ✅ **TCP Socket Communication** - High-performance bidirectional communication
-- ✅ **Smart Order Type Detection** - Automatically converts STOP/LIMIT based on market price
+- ✅ **Order Type Safety** - Validates STOP/LIMIT (and SL/TP sides) against the live market and **rejects** wrong-side orders instead of silently reinterpreting your intent
 - ✅ **Position Recovery** - Rebuilds tracking from existing orders on restart
 - ✅ **Multi-Symbol Support** - Optimized for Gold (XAUUSD) and Silver (XAGUSD)
 - ✅ **Risk Management** - Daily loss limits, max positions, spread checks
@@ -174,7 +174,7 @@ The EA automatically adjusts pip values based on symbol:
 
 **When TP2 closes (45 pips profit):**
 1. EA detects TP2 position is closed
-2. Automatically moves SL to TP1 price (15 pips from entry)
+2. Automatically moves SL to **your actual TP1 price** (the price you sent, not a fixed pip offset)
 3. Remaining 30% of position (TP3, TP4, TP5) is now **risk-free**
 4. Even if market reverses, you keep 15 pips profit on remaining positions
 
@@ -317,7 +317,7 @@ Place a new order with automatic splitting.
 
 **Parameters:**
 - `symbol` (string): Trading symbol ("XAUUSD" or "XAGUSD")
-- `order_type` (string): "BUY_STOP" or "SELL_STOP"
+- `order_type` (string): "BUY_STOP", "SELL_STOP", "BUY_LIMIT", or "SELL_LIMIT". The price must be on the correct side of the market for the type (e.g. BUY_STOP above the ask); wrong-side requests are rejected with an explanatory message rather than converted.
 - `price` (float): Entry price
 - `sl` (float): Stop loss price
 - `tp_levels` (array): 5 take profit levels
@@ -489,6 +489,23 @@ Configure in MT5 when attaching EA to chart:
 | `MaxSpreadPips` | 10 | Maximum allowed spread in pips |
 | `MaxDailyLossPercent` | 5.0 | Stop trading if daily loss exceeds % |
 
+### 🔒 Security
+
+This API can place and close real trades, so it is locked down by default:
+
+- **Localhost only** — the HTTP server binds to `127.0.0.1` unless you set `HOST=0.0.0.0`.
+- **Optional API key** — set the `API_KEY` environment variable and every trading endpoint (everything except `/` and `/health`) requires a matching `X-API-Key` header:
+
+```bash
+API_KEY=your-secret HOST=0.0.0.0 python server.py
+
+curl -X POST http://localhost:8080/order \
+  -H "X-API-Key: your-secret" -H "Content-Type: application/json" \
+  -d '{ ... }'
+```
+
+If you expose the server beyond localhost (e.g. Docker with `HOST=0.0.0.0`) **always** set `API_KEY`. The server prints a warning if you don't.
+
 ## 📦 Installation
 
 ### Option 1: Manual Installation
@@ -590,13 +607,13 @@ curl -X POST http://localhost:8080/safe-shutdown
 
 **Symptoms:** All split orders fail immediately
 
-**Cause:** Order type doesn't match price position relative to market
+**Cause:** The order type doesn't match the price's position relative to the market.
 
-**Solution:** The EA now auto-detects and converts:
-- SELL STOP above market → SELL LIMIT
-- BUY STOP below market → BUY LIMIT
+**Solution:** The EA validates this and returns a clear message instead of silently changing your order. Pick the type that matches your intent:
+- Entry **above** market → `BUY_STOP` (breakout) or `SELL_LIMIT` (fade)
+- Entry **below** market → `SELL_STOP` (breakout) or `BUY_LIMIT` (dip-buy)
 
-Recompile the EA with the latest code.
+SL and TP prices must also be on the correct side of the entry, or the order is rejected. Recompile the EA with the latest code.
 
 ### Port Already in Use
 

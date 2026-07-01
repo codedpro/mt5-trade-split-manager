@@ -1,33 +1,51 @@
 """
 MT5 TCP Server - Python listens on socket, MQL5 connects as client
-Claude AI → FastAPI → Queue → TCP Server → MQL5 EA
+Client -> FastAPI -> per-request envelope -> TCP Server -> MQL5 EA
+
+Safety notes:
+- Every API request gets its own response Event, so concurrent requests can
+  never receive each other's response (the old shared-queue design could).
+- A request that times out is marked "abandoned" so its command is NOT sent
+  to the EA later - important for a trading system (no surprise late orders).
+- Optional API-key auth (set API_KEY) and localhost-only binding by default.
 """
 
 import json
+import os
 import socket
 import threading
 import queue
-from fastapi import FastAPI, HTTPException
+import time
+
+from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import uvicorn
 
 # Load config
 with open('config.json', 'r') as f:
     config = json.load(f)
 
-# Queue for commands
-command_queue = queue.Queue()
-response_queue = queue.Queue()
-
-# TCP Server settings
+# TCP server (MQL5 connects here)
 TCP_HOST = '127.0.0.1'
 TCP_PORT = config['mt5']['zmq_port']
 
-print(f"✅ Config loaded - TCP Server will listen on {TCP_HOST}:{TCP_PORT}")
+# HTTP server. Default to localhost so trades can't be placed by anyone on the
+# network. Override with HOST=0.0.0.0 (e.g. in Docker) only behind auth.
+HTTP_HOST = os.environ.get('HOST', '127.0.0.1')
+HTTP_PORT = int(os.environ.get('PORT', '8080'))
 
-# FastAPI app
-app = FastAPI(title="MT5 TCP Bridge", version="4.0.0")
+# Optional shared secret. If set, every trading endpoint requires the matching
+# X-API-Key header. Strongly recommended whenever HOST is not localhost.
+API_KEY = os.environ.get('API_KEY', '')
+
+REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '10'))
+
+print(f"✅ Config loaded - TCP Server will listen on {TCP_HOST}:{TCP_PORT}")
+if not API_KEY and HTTP_HOST != '127.0.0.1':
+    print("⚠️  WARNING: HOST is not localhost and API_KEY is unset - the trading API is UNAUTHENTICATED.")
+
+app = FastAPI(title="MT5 TCP Bridge", version="4.1.0")
 
 
 class OrderCommand(BaseModel):
@@ -44,10 +62,46 @@ class OrderCommand(BaseModel):
     partial_close_percent: float = 20.0
 
 
+class Envelope:
+    """One in-flight command plus the machinery to deliver its response back to
+    exactly the request that issued it."""
+    __slots__ = ("cmd", "event", "result", "abandoned")
+
+    def __init__(self, cmd: dict):
+        self.cmd = cmd
+        self.event = threading.Event()
+        self.result = None
+        self.abandoned = False
+
+
+# Queue of Envelopes waiting to be handed to the EA on its next poll.
+command_queue: "queue.Queue[Envelope]" = queue.Queue()
+
+
+def _read_json_response(sock: socket.socket) -> dict:
+    """Read from the EA until a complete JSON object has arrived."""
+    sock.settimeout(REQUEST_TIMEOUT)
+    data = b''
+    while True:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        data += chunk
+        try:
+            return json.loads(data.decode('utf-8'))
+        except json.JSONDecodeError:
+            continue
+    try:
+        return json.loads(data.decode('utf-8'))
+    except Exception:
+        return {"success": False, "message": "Invalid or empty response from EA"}
+
+
 def tcp_server():
-    """
-    TCP Server thread - listens for MQL5 connections
-    """
+    """TCP Server thread - the MQL5 EA connects here on each poll."""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((TCP_HOST, TCP_PORT))
@@ -56,49 +110,73 @@ def tcp_server():
     print(f"🚀 TCP Server listening on {TCP_HOST}:{TCP_PORT}")
 
     while True:
+        client_socket = None
+        env = None
         try:
-            # Accept connection from MQL5
             client_socket, address = server_socket.accept()
-            print(f"📡 MQL5 connected from {address}")
 
-            # Check if there's a command waiting
-            if not command_queue.empty():
-                command = command_queue.get()
+            # Pull the next live (non-abandoned) command, if any.
+            env = None
+            while not command_queue.empty():
+                candidate = command_queue.get()
+                if candidate.abandoned:
+                    continue
+                env = candidate
+                break
 
-                # Send command to MQL5
-                command_json = json.dumps(command)
-                client_socket.sendall(command_json.encode('utf-8'))
-                print(f"📤 Sent to MQL5: {command_json[:100]}...")
-
-                # Receive response from MQL5
-                response_data = b''
-                while True:
-                    chunk = client_socket.recv(4096)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                    # Check if we received complete JSON
-                    try:
-                        response = json.loads(response_data.decode('utf-8'))
-                        break
-                    except:
-                        continue
-
-                print(f"📥 Received from MQL5: {response}")
-                response_queue.put(response)
-            else:
-                # No command, send empty response
+            if env is None or env.abandoned:
                 client_socket.sendall(b'{"status":"waiting"}')
+                client_socket.close()
+                continue
 
-            client_socket.close()
+            print(f"📡 MQL5 connected from {address}")
+            command_json = json.dumps(env.cmd)
+            client_socket.sendall(command_json.encode('utf-8'))
+            print(f"📤 Sent to MQL5: {command_json[:100]}...")
+
+            response = _read_json_response(client_socket)
+            print(f"📥 Received from MQL5: {response}")
+
+            # Deliver the response to the exact request that is waiting on it.
+            env.result = response
+            env.event.set()
 
         except Exception as e:
             print(f"❌ TCP Server error: {e}")
+            if env is not None and not env.event.is_set():
+                env.result = {"success": False, "message": f"bridge error: {e}"}
+                env.event.set()
+        finally:
+            if client_socket is not None:
+                try:
+                    client_socket.close()
+                except Exception:
+                    pass
 
 
 # Start TCP server in background thread
 tcp_thread = threading.Thread(target=tcp_server, daemon=True)
 tcp_thread.start()
+
+
+def require_key(x_api_key: Optional[str] = Header(default=None)):
+    """Enforce the API key on trading endpoints when one is configured."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def send_command_to_mt5(command: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
+    """Queue a command and wait for its own response. On timeout the command is
+    abandoned so it will not be executed by the EA on a later poll."""
+    env = Envelope(command)
+    command_queue.put(env)
+
+    if env.event.wait(timeout):
+        return env.result
+
+    # Timed out: prevent this command from firing late.
+    env.abandoned = True
+    raise HTTPException(status_code=504, detail="MT5 timeout - EA not connecting")
 
 
 @app.get("/")
@@ -111,35 +189,14 @@ async def health():
     return {
         "status": "healthy",
         "tcp_host": TCP_HOST,
-        "tcp_port": TCP_PORT
+        "tcp_port": TCP_PORT,
+        "auth_required": bool(API_KEY),
     }
 
 
-def send_command_to_mt5(command: dict, timeout: int = 10):
-    """
-    Helper function to send command to MT5 and wait for response
-    """
-    import time
-
-    # Add command to queue
-    command_queue.put(command)
-
-    # Wait for response
-    start = time.time()
-    while time.time() - start < timeout:
-        if not response_queue.empty():
-            response = response_queue.get()
-            return response
-        time.sleep(0.1)
-
-    raise HTTPException(status_code=504, detail="MT5 timeout - EA not connecting")
-
-
-@app.post("/order")
+@app.post("/order", dependencies=[Depends(require_key)])
 async def create_order(order: OrderCommand):
-    """
-    Place order on MT5 via TCP
-    """
+    """Place order on MT5 via TCP (split into 5 positions by the EA)."""
     command = {
         "action": "PLACE_ORDER",
         "data": {
@@ -152,114 +209,44 @@ async def create_order(order: OrderCommand):
             "deviation": order.deviation,
             "comment": order.comment,
             "magic_number": order.magic_number,
-            "partial_close_percent": order.partial_close_percent
-        }
+            "partial_close_percent": order.partial_close_percent,
+        },
     }
-
-    try:
-        response = send_command_to_mt5(command)
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return send_command_to_mt5(command)
 
 
-@app.get("/positions")
+@app.get("/positions", dependencies=[Depends(require_key)])
 async def get_positions():
-    """
-    Get all open positions from MT5
-    """
-    command = {"action": "GET_POSITIONS"}
-
-    try:
-        response = send_command_to_mt5(command)
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return send_command_to_mt5({"action": "GET_POSITIONS"})
 
 
-@app.get("/orders")
+@app.get("/orders", dependencies=[Depends(require_key)])
 async def get_orders():
-    """
-    Get all pending orders from MT5
-    """
-    command = {"action": "GET_ORDERS"}
-
-    try:
-        response = send_command_to_mt5(command)
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return send_command_to_mt5({"action": "GET_ORDERS"})
 
 
-@app.delete("/order/{ticket}")
+@app.delete("/order/{ticket}", dependencies=[Depends(require_key)])
 async def delete_order(ticket: int):
-    """
-    Delete/cancel a pending order by ticket number
-    """
-    command = {
-        "action": "DELETE_ORDER",
-        "data": {"ticket": ticket}
-    }
-
-    try:
-        response = send_command_to_mt5(command)
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return send_command_to_mt5({"action": "DELETE_ORDER", "data": {"ticket": ticket}})
 
 
-@app.delete("/position/{ticket}")
+@app.delete("/position/{ticket}", dependencies=[Depends(require_key)])
 async def close_position(ticket: int):
-    """
-    Close an open position by ticket number
-    """
-    command = {
-        "action": "CLOSE_POSITION",
-        "data": {"ticket": ticket}
-    }
-
-    try:
-        response = send_command_to_mt5(command)
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return send_command_to_mt5({"action": "CLOSE_POSITION", "data": {"ticket": ticket}})
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(require_key)])
 async def get_stats():
-    """
-    Get account statistics and EA status
-    """
-    command = {"action": "GET_STATS"}
-
-    try:
-        response = send_command_to_mt5(command)
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return send_command_to_mt5({"action": "GET_STATS"})
 
 
-@app.post("/safe-shutdown")
+@app.post("/safe-shutdown", dependencies=[Depends(require_key)])
 async def safe_shutdown():
-    """
-    Safe shutdown mode - consolidates all TPs (TP2-TP5) to TP2 level (45 pips)
-    Protects positions when you need to close MT5 and go to sleep/away
-    """
-    command = {"action": "SAFE_SHUTDOWN"}
-
-    try:
-        response = send_command_to_mt5(command)
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Consolidate remaining TPs (TP2-TP5) to the TP2 level before going away."""
+    return send_command_to_mt5({"action": "SAFE_SHUTDOWN"})
 
 
 if __name__ == "__main__":
     print("🚀 Starting MT5 TCP Bridge Server...")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8080,
-        reload=False,
-        log_level="info"
-    )
+    print(f"   HTTP API: http://{HTTP_HOST}:{HTTP_PORT}  (auth: {'on' if API_KEY else 'off'})")
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT, reload=False, log_level="info")

@@ -4,13 +4,15 @@ services:
   signal-server:
     build: .
     container_name: mt5-signal-server
-    ports:
-      - "8080:8080"
     volumes:
       - ./server.py:/app/server.py
       - ./config.json:/app/config.json
-      - ./.env:/app/.env
     environment:
       - PYTHONUNBUFFERED=1
-    network_mode: "host"  # Required for ZeroMQ to communicate with MT5 on localhost
+      - HOST=0.0.0.0
+      # Set a secret to require X-API-Key on trading endpoints (recommended).
+      - API_KEY=${API_KEY:-}
+    # Host networking lets the TCP bridge talk to MT5 on localhost and exposes
+    # the HTTP API directly on the host, so an explicit port mapping is not used.
+    network_mode: "host"
     restart: unless-stopped
