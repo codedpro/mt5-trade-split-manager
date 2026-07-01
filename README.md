@@ -1,5 +1,6 @@
 # MT5 Trade Split Manager 🤖
 
+[![Compile EA](https://github.com/codedpro/mt5-trade-split-manager/actions/workflows/compile-ea.yml/badge.svg)](https://github.com/codedpro/mt5-trade-split-manager/actions/workflows/compile-ea.yml)
 [![MetaTrader 5](https://img.shields.io/badge/MetaTrader-5-blue.svg)](https://www.metatrader5.com/)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109.0-green.svg)](https://fastapi.tiangolo.com/)
