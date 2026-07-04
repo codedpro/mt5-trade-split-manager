@@ -81,8 +81,10 @@ jobs:
           Copy-Item "bulk-add-signals.mq5" $src -Force
           if (Test-Path $ex5) { Remove-Item $ex5 -Force }
 
+          # /portable makes MetaEditor resolve includes from the install-dir MQL5
+          # tree (where Trade.mqh is) instead of the empty roaming data directory.
           Start-Process -FilePath "$mt5\MetaEditor64.exe" `
-            -ArgumentList "/compile:`"$src`"", "/log:`"$log`"" -Wait
+            -ArgumentList "/portable", "/compile:`"$src`"", "/log:`"$log`"" -Wait
 
           if (-not (Test-Path $log)) { throw "No compile log was produced" }
           # MetaEditor writes the log as UTF-16.
