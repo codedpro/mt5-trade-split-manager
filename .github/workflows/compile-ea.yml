@@ -1,0 +1,110 @@
+name: Compile EA
+
+# Compiles the MQL5 Expert Advisor with the real MetaEditor compiler so a PR
+# that doesn't build can't be merged. Runs on a Windows runner (MetaEditor is
+# a native Windows app) and fails the job on any compile error.
+
+on:
+  push:
+    paths:
+      - "bulk-add-signals.mq5"
+      - ".github/workflows/compile-ea.yml"
+  pull_request:
+    paths:
+      - "bulk-add-signals.mq5"
+      - ".github/workflows/compile-ea.yml"
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download MetaTrader 5 installer
+        shell: pwsh
+        run: |
+          $url = "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\mt5setup.exe"
+          Write-Host "Downloaded installer ($((Get-Item "$env:RUNNER_TEMP\mt5setup.exe").Length) bytes)"
+
+      - name: Install MetaTrader 5 + standard library
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $mt5 = "C:\Program Files\MetaTrader 5"
+          $me  = "$mt5\MetaEditor64.exe"
+          $inc = "$mt5\MQL5\Include\Trade\Trade.mqh"
+
+          function Wait-ForPath($p, $minutes) {
+            $deadline = (Get-Date).AddMinutes($minutes)
+            while (-not (Test-Path -LiteralPath $p) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 5 }
+            return (Test-Path -LiteralPath $p)
+          }
+
+          Start-Process -FilePath "$env:RUNNER_TEMP\mt5setup.exe" -ArgumentList "/auto" | Out-Null
+
+          # Wait for the compiler itself.
+          if (-not (Wait-ForPath $me 8)) { throw "MetaEditor not found - install did not complete" }
+          Write-Host "MetaEditor installed: $me"
+
+          # The installer normally lays down the MQL5 standard library too, but it
+          # writes files in stages - wait for the header the compile actually needs.
+          if (-not (Wait-ForPath $inc 4)) {
+            # Fallback: unpack it by launching the terminal once (guard on the exe
+            # existing first, so we never race on a not-yet-written terminal64.exe).
+            $term = "$mt5\terminal64.exe"
+            if (Wait-ForPath $term 4) {
+              Write-Host "Standard library missing; launching terminal to unpack it..."
+              $p = Start-Process -FilePath $term -ArgumentList "/portable" -WorkingDirectory $mt5 -PassThru
+              Wait-ForPath $inc 3 | Out-Null
+              try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+            }
+          }
+
+          if (-not (Test-Path -LiteralPath $inc)) { throw "MQL5 standard library not found at $inc" }
+          Write-Host "Standard library ready: $inc"
+
+          # Ensure no terminal process is holding files open before we compile.
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Compile
+        shell: pwsh
+        run: |
+          $mt5     = "C:\Program Files\MetaTrader 5"
+          $experts = "$mt5\MQL5\Experts"
+          $src     = "$experts\bulk-add-signals.mq5"
+          $ex5     = "$experts\bulk-add-signals.ex5"
+          $log     = "$env:RUNNER_TEMP\compile.log"
+
+          Copy-Item "bulk-add-signals.mq5" $src -Force
+          if (Test-Path $ex5) { Remove-Item $ex5 -Force }
+
+          # /portable makes MetaEditor resolve includes from the install-dir MQL5
+          # tree (where Trade.mqh is) instead of the empty roaming data directory.
+          Start-Process -FilePath "$mt5\MetaEditor64.exe" `
+            -ArgumentList "/portable", "/compile:`"$src`"", "/log:`"$log`"" -Wait
+
+          if (-not (Test-Path $log)) { throw "No compile log was produced" }
+          # MetaEditor writes the log as UTF-16.
+          $text = Get-Content -Path $log -Encoding Unicode -Raw
+          Write-Host "----------------- MetaEditor log -----------------"
+          Write-Host $text
+          Write-Host "--------------------------------------------------"
+
+          $m = [regex]::Match($text, "Result:\s*(\d+)\s*error")
+          $errors = if ($m.Success) { [int]$m.Groups[1].Value } else { 1 }
+
+          if ($errors -gt 0 -or -not (Test-Path $ex5)) {
+            throw "Compilation FAILED ($errors error(s)); see log above."
+          }
+          Write-Host "Compilation succeeded (0 errors)."
+
+      - name: Upload compiled .ex5
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bulk-add-signals-ex5
+          path: C:\Program Files\MetaTrader 5\MQL5\Experts\bulk-add-signals.ex5
+          if-no-files-found: error

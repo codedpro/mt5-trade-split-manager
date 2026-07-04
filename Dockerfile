@@ -13,5 +13,10 @@ COPY config.json .
 # Expose API port
 EXPOSE 8080
 
-# Run the server
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+# Inside a container we must bind all interfaces. Set API_KEY (e.g. via
+# docker-compose environment or --env) to require auth on the trading endpoints.
+ENV HOST=0.0.0.0
+ENV PORT=8080
+
+# Run the server (no --reload in production)
+CMD ["python", "server.py"]
