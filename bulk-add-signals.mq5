@@ -169,7 +169,7 @@ void OnTimer()
     }
 
     // Only log actual trading commands
-    Print("📡 Connected - Received command: ", StringSubstr(commandJson, 0, MathMin(100, StringLen(commandJson))), "...");
+    Print("[NET] Connected - Received command: ", StringSubstr(commandJson, 0, MathMin(100, StringLen(commandJson))), "...");
 
     // Process command
     string response = ProcessCommand(commandJson);
@@ -418,7 +418,7 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     if(orderType == WRONG_VALUE)
     {
         errorMsg = "Unknown order_type '" + cmd.order_type + "' (expected BUY_STOP/SELL_STOP/BUY_LIMIT/SELL_LIMIT)";
-        Print("❌ ", errorMsg);
+        Print("[ERR] ", errorMsg);
         return 0;
     }
 
@@ -436,21 +436,21 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     if(sideError != "")
     {
         errorMsg = StringFormat("%s (ask=%.5f bid=%.5f price=%.5f)", sideError, ask, bid, cmd.price);
-        Print("❌ Refusing order: ", errorMsg);
+        Print("[ERR] Refusing order: ", errorMsg);
         return 0;
     }
 
     // Validate SL / TP are on the correct side of the entry for the direction.
     if(cmd.sl > 0)
     {
-        if(isBuy && cmd.sl >= cmd.price)  { errorMsg = "BUY stop-loss must be below entry price";  Print("❌ ", errorMsg); return 0; }
-        if(!isBuy && cmd.sl <= cmd.price) { errorMsg = "SELL stop-loss must be above entry price"; Print("❌ ", errorMsg); return 0; }
+        if(isBuy && cmd.sl >= cmd.price)  { errorMsg = "BUY stop-loss must be below entry price";  Print("[ERR] ", errorMsg); return 0; }
+        if(!isBuy && cmd.sl <= cmd.price) { errorMsg = "SELL stop-loss must be above entry price"; Print("[ERR] ", errorMsg); return 0; }
     }
     for(int t = 0; t < 5; t++)
     {
-        if(cmd.tp_levels[t] <= 0)                       { errorMsg = StringFormat("TP%d is missing or invalid", t+1);     Print("❌ ", errorMsg); return 0; }
-        if(isBuy && cmd.tp_levels[t] <= cmd.price)      { errorMsg = StringFormat("BUY TP%d must be above entry price", t+1);  Print("❌ ", errorMsg); return 0; }
-        if(!isBuy && cmd.tp_levels[t] >= cmd.price)     { errorMsg = StringFormat("SELL TP%d must be below entry price", t+1); Print("❌ ", errorMsg); return 0; }
+        if(cmd.tp_levels[t] <= 0)                       { errorMsg = StringFormat("TP%d is missing or invalid", t+1);     Print("[ERR] ", errorMsg); return 0; }
+        if(isBuy && cmd.tp_levels[t] <= cmd.price)      { errorMsg = StringFormat("BUY TP%d must be above entry price", t+1);  Print("[ERR] ", errorMsg); return 0; }
+        if(!isBuy && cmd.tp_levels[t] >= cmd.price)     { errorMsg = StringFormat("SELL TP%d must be below entry price", t+1); Print("[ERR] ", errorMsg); return 0; }
     }
 
     Print("Executing ", cmd.order_type, " order on ", cmd.symbol);
@@ -514,14 +514,14 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 
             if(firstTicket == 0) firstTicket = ticket;
 
-            Print("✅ Split order ", i+1, "/5 placed - Ticket: ", ticket,
+            Print("[OK] Split order ", i+1, "/5 placed - Ticket: ", ticket,
                   " | Vol: ", volumes[i], " | TP", i+1, ": ", cmd.tp_levels[i]);
             successCount++;
         }
         else
         {
             errorMsg = trade.ResultRetcodeDescription();
-            Print("❌ Split order ", i+1, "/5 failed - ", errorMsg);
+            Print("[ERR] Split order ", i+1, "/5 failed - ", errorMsg);
             orderGroups[groupIndex].tickets[i] = 0;
         }
     }
@@ -537,7 +537,7 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     // Draw TP levels on chart (once for the group) using the ACTUAL TP prices
     DrawTPLevels(groupId, cmd.symbol, cmd.price, orderGroups[groupIndex].tp_prices);
 
-    Print("✅ Order group placed: ", successCount, "/5 orders successful");
+    Print("[OK] Order group placed: ", successCount, "/5 orders successful");
     return firstTicket;  // Return first ticket as reference
 }
 
@@ -614,7 +614,7 @@ void UpdateTPLevelClosed(string groupId, int level)
 
     // Update text to show "CLOSED"
     double price = ObjectGetDouble(0, lineName, OBJPROP_PRICE);
-    ObjectSetString(0, labelName, OBJPROP_TEXT, StringFormat("  TP%d: %.3f ✓CLOSED", level, price));
+    ObjectSetString(0, labelName, OBJPROP_TEXT, StringFormat("  TP%d: %.3f CLOSED", level, price));
 
     ChartRedraw();
 }
@@ -660,7 +660,7 @@ void CheckTP2ForTrailingSL()
         if(!PositionSelectByTicket(tp2_ticket))
         {
             // TP2 was hit! Move SL to TP1 for all remaining positions
-            Print("🎯 TP2 reached for group ", orderGroups[i].groupId, " - Moving SL to TP1 for all remaining positions");
+            Print("[HIT] TP2 reached for group ", orderGroups[i].groupId, " - Moving SL to TP1 for all remaining positions");
 
             // Use the ACTUAL TP1 price that was placed - not a hardcoded pip
             // offset that may not match the caller's TP ladder. Fall back to
@@ -692,12 +692,12 @@ void CheckTP2ForTrailingSL()
                     {
                         if(trade.PositionModify(ticket, newSL, currentTP))
                         {
-                            Print("✅ SL moved to TP1 for position #", ticket, " (TP", j+1, ")");
+                            Print("[OK] SL moved to TP1 for position #", ticket, " (TP", j+1, ")");
                             movedCount++;
                         }
                         else
                         {
-                            Print("⚠️  Failed to move SL for position #", ticket, ": ", trade.ResultRetcodeDescription());
+                            Print("[WARN]  Failed to move SL for position #", ticket, ": ", trade.ResultRetcodeDescription());
                         }
                     }
                 }
@@ -705,7 +705,7 @@ void CheckTP2ForTrailingSL()
 
             if(movedCount > 0)
             {
-                Print("✅ Trailing SL applied: ", movedCount, " position(s) now have SL at TP1 (", newSL, ")");
+                Print("[OK] Trailing SL applied: ", movedCount, " position(s) now have SL at TP1 (", newSL, ")");
             }
 
             // Mark as TP2 reached
@@ -729,7 +729,7 @@ void CheckTP2ForTrailingSL()
 
         if(allClosed)
         {
-            Print("🏁 All positions closed for group ", orderGroups[i].groupId);
+            Print("[END] All positions closed for group ", orderGroups[i].groupId);
             RemoveTPObjects(orderGroups[i].groupId);
             ArrayRemove(orderGroups, i, 1);
         }
@@ -863,7 +863,7 @@ void RecoverSplitOrders()
                 orderGroups[gi].order_type  = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
             }
 
-            Print("   ✅ Found position TP", tpLevel, " - Ticket #", position.Ticket());
+            Print("   [OK] Found position TP", tpLevel, " - Ticket #", position.Ticket());
         }
     }
 
@@ -887,7 +887,7 @@ void RecoverSplitOrders()
                 orderGroups[gi].order_type  = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
             }
 
-            Print("   📋 Found pending order TP", tpLevel, " - Ticket #", ticket);
+            Print("   [ORD] Found pending order TP", tpLevel, " - Ticket #", ticket);
         }
     }
 
@@ -904,7 +904,7 @@ void RecoverSplitOrders()
             orderGroups[g].tickets[4] > 0))
         {
             orderGroups[g].tp2_reached = true;
-            Print("   🎯 TP2 already reached for group ", orderGroups[g].groupId);
+            Print("   [HIT] TP2 already reached for group ", orderGroups[g].groupId);
         }
 
         if(orderGroups[g].entry_price > 0)
@@ -917,13 +917,13 @@ void RecoverSplitOrders()
                 if(orderGroups[g].tickets[t] == 0)
                     UpdateTPLevelClosed(orderGroups[g].groupId, t + 1);
 
-            Print("✅ Group ", orderGroups[g].groupId, " recovered successfully");
+            Print("[OK] Group ", orderGroups[g].groupId, " recovered successfully");
         }
     }
 
     Print("");
     Print("==== Split Order Recovery Complete ====");
-    Print("✅ Recovered ", groupCount, " order group(s)");
+    Print("[OK] Recovered ", groupCount, " order group(s)");
     Print("=======================================");
 }
 
@@ -1020,13 +1020,13 @@ string HandleDeleteOrder(string commandJson)
 
     if(trade.OrderDelete(ticket))
     {
-        Print("✅ Order #", ticket, " deleted successfully");
+        Print("[OK] Order #", ticket, " deleted successfully");
         return StringFormat("{\"success\":true,\"message\":\"Order deleted\",\"ticket\":%d}", ticket);
     }
     else
     {
         string error = trade.ResultRetcodeDescription();
-        Print("❌ Failed to delete order #", ticket, " - ", error);
+        Print("[ERR] Failed to delete order #", ticket, " - ", error);
         return StringFormat("{\"success\":false,\"message\":\"%s\",\"ticket\":%d}", error, ticket);
     }
 }
@@ -1059,7 +1059,7 @@ string HandleClosePosition(string commandJson)
 
     if(trade.PositionClose(ticket))
     {
-        Print("✅ Position #", ticket, " closed successfully");
+        Print("[OK] Position #", ticket, " closed successfully");
 
         // Clean up visual objects if we have the group ID
         if(StringLen(groupId) > 0)
@@ -1095,7 +1095,7 @@ string HandleClosePosition(string commandJson)
     else
     {
         string error = trade.ResultRetcodeDescription();
-        Print("❌ Failed to close position #", ticket, " - ", error);
+        Print("[ERR] Failed to close position #", ticket, " - ", error);
         return StringFormat("{\"success\":false,\"message\":\"%s\",\"ticket\":%I64u}", error, ticket);
     }
 }
@@ -1117,11 +1117,11 @@ string HandleSafeShutdown()
         // Skip groups that already reached TP2 (already protected)
         if(orderGroups[i].tp2_reached)
         {
-            Print("⏭️  Skipping group ", orderGroups[i].groupId, " - TP2 already reached");
+            Print("[SKIP]  Skipping group ", orderGroups[i].groupId, " - TP2 already reached");
             continue;
         }
 
-        Print("🔄 Processing group: ", orderGroups[i].groupId);
+        Print("[REC] Processing group: ", orderGroups[i].groupId);
 
         double entry = orderGroups[i].entry_price;
 
@@ -1129,7 +1129,7 @@ string HandleSafeShutdown()
         double tp2Price = orderGroups[i].tp_prices[1];
         if(tp2Price <= 0)
         {
-            Print("⚠️  Skipping group ", orderGroups[i].groupId, " - TP2 price unknown");
+            Print("[WARN]  Skipping group ", orderGroups[i].groupId, " - TP2 price unknown");
             continue;
         }
 
@@ -1148,13 +1148,13 @@ string HandleSafeShutdown()
 
                 if(trade.OrderModify(ticket, entry, currentSL, tp2Price, ORDER_TIME_GTC, 0))
                 {
-                    Print("✅ Pending order #", ticket, " (TP", j+1, ") modified to TP2: ", tp2Price);
+                    Print("[OK] Pending order #", ticket, " (TP", j+1, ") modified to TP2: ", tp2Price);
                     pendingOrdersModified++;
                     modifiedInGroup++;
                 }
                 else
                 {
-                    Print("⚠️  Failed to modify pending order #", ticket, ": ", trade.ResultRetcodeDescription());
+                    Print("[WARN]  Failed to modify pending order #", ticket, ": ", trade.ResultRetcodeDescription());
                 }
             }
             // Check if it's an open position
@@ -1164,13 +1164,13 @@ string HandleSafeShutdown()
 
                 if(trade.PositionModify(ticket, currentSL, tp2Price))
                 {
-                    Print("✅ Open position #", ticket, " (TP", j+1, ") modified to TP2: ", tp2Price);
+                    Print("[OK] Open position #", ticket, " (TP", j+1, ") modified to TP2: ", tp2Price);
                     openPositionsModified++;
                     modifiedInGroup++;
                 }
                 else
                 {
-                    Print("⚠️  Failed to modify position #", ticket, ": ", trade.ResultRetcodeDescription());
+                    Print("[WARN]  Failed to modify position #", ticket, ": ", trade.ResultRetcodeDescription());
                 }
             }
         }
