@@ -5,12 +5,18 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
 #property link      "https://www.mql5.com"
-#property version   "4.00"
+#property version   "4.20"
 #property description "Receives trading signals via TCP sockets (MQL5 as client)"
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
 #include <Trade/AccountInfo.mqh>
+
+//--- Maximum number of split levels supported per order group.
+//    Fixed-capacity arrays are used everywhere (no dynamic arrays inside
+//    structs); every loop respects the group's real count or guards on
+//    ticket==0 / tp_price<=0 for the unused tail.
+#define MAX_SPLITS 10
 
 //--- Input parameters
 input string ServerHost = "127.0.0.1";       // Python server host
@@ -39,7 +45,9 @@ struct TradeCommand {
     string symbol;
     double price;
     double sl;
-    double tp_levels[5];
+    double tp_levels[MAX_SPLITS];    // Requested TP prices (tp_count of them are valid)
+    double volume_split[MAX_SPLITS]; // Fraction of total lot per level (parallel to tp_levels)
+    int tp_count;                    // Number of TP levels actually provided (1..MAX_SPLITS)
     double lot_size;
     int deviation;
     string comment;
@@ -47,8 +55,9 @@ struct TradeCommand {
 
 struct SplitOrderGroup {
     string groupId;           // Unique identifier for the group (based on entry price + symbol)
-    ulong tickets[5];         // Tickets for all 5 split orders
-    double tp_prices[5];      // Actual TP price placed for each split (source of truth)
+    ulong tickets[MAX_SPLITS];  // Tickets for all split orders (0 = missing/skipped)
+    double tp_prices[MAX_SPLITS]; // Actual TP price placed for each split (source of truth)
+    int count;                // Number of split levels in this group (1..MAX_SPLITS)
     bool tp2_reached;         // Flag to track if TP2 was reached
     double entry_price;       // Entry price
     string symbol;            // Symbol
@@ -108,6 +117,11 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+    // Run trailing from the timer as well as OnTick: OnTick only fires for
+    // the chart's own symbol, so groups on other symbols would otherwise not
+    // trail until this chart happened to tick.
+    CheckTP2ForTrailingSL();
+
     // Create TCP socket
     int socket = SocketCreate();
     if(socket == INVALID_HANDLE)
@@ -242,6 +256,31 @@ string ProcessCommand(string commandJson)
 }
 
 //+------------------------------------------------------------------+
+//| Apply the default volume split when the caller omits one.         |
+//| N==1 -> [1.0]; N>=2 -> TP1=0.60, each remaining = 0.40/(N-1).     |
+//| For N==5 this reproduces the legacy 60/10/10/10/10 exactly.       |
+//+------------------------------------------------------------------+
+void ApplyDefaultVolumeSplit(TradeCommand &cmd)
+{
+    for(int i = 0; i < MAX_SPLITS; i++)
+        cmd.volume_split[i] = 0;
+
+    int n = cmd.tp_count;
+    if(n <= 0) return;
+
+    if(n == 1)
+    {
+        cmd.volume_split[0] = 1.0;
+        return;
+    }
+
+    cmd.volume_split[0] = 0.60;
+    double rest = 0.40 / (double)(n - 1);
+    for(int i = 1; i < n; i++)
+        cmd.volume_split[i] = rest;
+}
+
+//+------------------------------------------------------------------+
 //| Handle place order command                                        |
 //+------------------------------------------------------------------+
 string HandlePlaceOrder(string commandJson)
@@ -270,7 +309,18 @@ string HandlePlaceOrder(string commandJson)
     cmd.lot_size = ExtractDouble(dataJson, "lot_size");
     cmd.deviation = (int)ExtractDouble(dataJson, "deviation");
 
-    // Extract TP levels
+    // Zero out the fixed-capacity arrays before parsing.
+    for(int i = 0; i < MAX_SPLITS; i++)
+    {
+        cmd.tp_levels[i]    = 0;
+        cmd.volume_split[i] = 0;
+    }
+    cmd.tp_count = 0;
+
+    // Extract TP levels (1..MAX_SPLITS entries). tp_raw is how many the caller
+    // actually sent; tp_count is that clamped to capacity and drives every
+    // downstream loop.
+    int tp_raw = 0;
     int tp_start = StringFind(dataJson, "\"tp_levels\"");
     if(tp_start >= 0)
     {
@@ -279,8 +329,10 @@ string HandlePlaceOrder(string commandJson)
         string tp_str = StringSubstr(dataJson, arr_start + 1, arr_end - arr_start - 1);
 
         string tp_values[];
-        StringSplit(tp_str, ',', tp_values);
-        for(int i = 0; i < MathMin(5, ArraySize(tp_values)); i++)
+        tp_raw = StringSplit(tp_str, ',', tp_values);
+        if(tp_raw < 0) tp_raw = 0;
+        int tp_parse = (int)MathMin(MAX_SPLITS, tp_raw);
+        for(int i = 0; i < tp_parse; i++)
         {
             // Clean whitespace
             string val = tp_values[i];
@@ -288,9 +340,68 @@ string HandlePlaceOrder(string commandJson)
             StringTrimRight(val);
             cmd.tp_levels[i] = StringToDouble(val);
         }
+        cmd.tp_count = tp_parse;
     }
 
-    Print("Parsed command: ", cmd.order_type, " ", cmd.symbol, " @ ", cmd.price, " SL:", cmd.sl, " Lot:", cmd.lot_size);
+    // Extract optional volume_split. When present its length must match
+    // tp_count. When absent, apply the same default formula as the server so
+    // direct TCP callers behave identically (defense in depth).
+    bool haveSplit = false;
+    int vs_raw = 0;
+    int vs_start = StringFind(dataJson, "\"volume_split\"");
+    if(vs_start >= 0)
+    {
+        int varr_start = StringFind(dataJson, "[", vs_start);
+        int varr_end = StringFind(dataJson, "]", varr_start);
+        if(varr_start >= 0 && varr_end > varr_start)
+        {
+            string vs_str = StringSubstr(dataJson, varr_start + 1, varr_end - varr_start - 1);
+            string vs_trim = vs_str;
+            StringTrimLeft(vs_trim);
+            StringTrimRight(vs_trim);
+            if(StringLen(vs_trim) > 0)
+            {
+                haveSplit = true;
+                string vs_values[];
+                vs_raw = StringSplit(vs_str, ',', vs_values);
+                if(vs_raw < 0) vs_raw = 0;
+                int vs_parse = (int)MathMin(MAX_SPLITS, vs_raw);
+                for(int i = 0; i < vs_parse; i++)
+                {
+                    string val = vs_values[i];
+                    StringTrimLeft(val);
+                    StringTrimRight(val);
+                    cmd.volume_split[i] = StringToDouble(val);
+                }
+            }
+        }
+    }
+
+    if(!haveSplit)
+        ApplyDefaultVolumeSplit(cmd);
+
+    Print("Parsed command: ", cmd.order_type, " ", cmd.symbol, " @ ", cmd.price, " SL:", cmd.sl, " Lot:", cmd.lot_size, " TPs:", cmd.tp_count);
+
+    // Validate level count and volume split (mirrors the server-side rules).
+    if(tp_raw < 1 || tp_raw > MAX_SPLITS)
+        return BuildResponse(false, StringFormat("tp_levels must contain 1..%d prices (got %d)", MAX_SPLITS, tp_raw), 0);
+
+    if(haveSplit && vs_raw != cmd.tp_count)
+        return BuildResponse(false, StringFormat("volume_split length (%d) must match tp_levels count (%d)", vs_raw, cmd.tp_count), 0);
+
+    double splitSum = 0;
+    bool anyPositive = false;
+    for(int i = 0; i < cmd.tp_count; i++)
+    {
+        if(cmd.volume_split[i] < 0)
+            return BuildResponse(false, StringFormat("volume_split[%d] must be >= 0", i+1), 0);
+        if(cmd.volume_split[i] > 0) anyPositive = true;
+        splitSum += cmd.volume_split[i];
+    }
+    if(!anyPositive)
+        return BuildResponse(false, "volume_split must have at least one entry > 0", 0);
+    if(splitSum < 0.99 || splitSum > 1.01)
+        return BuildResponse(false, StringFormat("volume_split must sum to ~1.0 (got %.4f)", splitSum), 0);
 
     // Validate
     if(!ValidateCommand(cmd))
@@ -407,7 +518,7 @@ bool ValidateCommand(TradeCommand &cmd)
 }
 
 //+------------------------------------------------------------------+
-//| Execute order - Now splits into 5 separate orders                |
+//| Execute order - splits into up to MAX_SPLITS orders per split    |
 //+------------------------------------------------------------------+
 ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 {
@@ -446,7 +557,7 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
         if(isBuy && cmd.sl >= cmd.price)  { errorMsg = "BUY stop-loss must be below entry price";  Print("[ERR] ", errorMsg); return 0; }
         if(!isBuy && cmd.sl <= cmd.price) { errorMsg = "SELL stop-loss must be above entry price"; Print("[ERR] ", errorMsg); return 0; }
     }
-    for(int t = 0; t < 5; t++)
+    for(int t = 0; t < cmd.tp_count; t++)
     {
         if(cmd.tp_levels[t] <= 0)                       { errorMsg = StringFormat("TP%d is missing or invalid", t+1);     Print("[ERR] ", errorMsg); return 0; }
         if(isBuy && cmd.tp_levels[t] <= cmd.price)      { errorMsg = StringFormat("BUY TP%d must be above entry price", t+1);  Print("[ERR] ", errorMsg); return 0; }
@@ -455,17 +566,64 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 
     Print("Executing ", cmd.order_type, " order on ", cmd.symbol);
     Print("Ask: ", ask, " | Bid: ", bid, " | Order price: ", cmd.price, " | SL: ", cmd.sl, " | Total Lot: ", cmd.lot_size);
-    Print("Will split into 5 orders: TP1=60%, TP2-TP5=10% each");
+    Print("Splitting into ", cmd.tp_count, " order(s) per volume_split");
 
-    // Calculate volume splits
-    // TP1: 60% of total volume
-    // TP2-TP5: 10% each (remaining 40% split equally)
-    double volumes[5];
-    volumes[0] = NormalizeDouble(cmd.lot_size * 0.60, 2);  // 60% for TP1
-    volumes[1] = NormalizeDouble(cmd.lot_size * 0.10, 2);  // 10% for TP2
-    volumes[2] = NormalizeDouble(cmd.lot_size * 0.10, 2);  // 10% for TP3
-    volumes[3] = NormalizeDouble(cmd.lot_size * 0.10, 2);  // 10% for TP4
-    volumes[4] = NormalizeDouble(cmd.lot_size * 0.10, 2);  // 10% for TP5
+    // --- Volume computation (any-symbol correct) ---
+    // Floor each split to the symbol's volume step; reject the whole order if
+    // any nonzero split floors below the broker minimum; add the flooring
+    // leftover to the first level with the largest ratio.
+    double step = SymbolInfoDouble(cmd.symbol, SYMBOL_VOLUME_STEP);
+    if(step <= 0) step = 0.01;  // Fallback when the broker reports no step
+    double volMin = SymbolInfoDouble(cmd.symbol, SYMBOL_VOLUME_MIN);
+
+    double volumes[MAX_SPLITS];
+    for(int i = 0; i < MAX_SPLITS; i++) volumes[i] = 0;
+
+    double sumVol = 0;
+    for(int i = 0; i < cmd.tp_count; i++)
+    {
+        double v = MathFloor(cmd.lot_size * cmd.volume_split[i] / step + 1e-9) * step;
+        v = NormalizeDouble(v, 8);  // strip floating-point dust from the multiply
+
+        if(cmd.volume_split[i] > 0 && v < volMin)
+        {
+            double minViable = MathCeil((volMin / cmd.volume_split[i]) / step - 1e-9) * step;
+            errorMsg = StringFormat("TP%d volume %.4f below broker minimum %.4f - increase lot_size to at least %.4f",
+                                    i+1, v, volMin, minViable);
+            Print("[ERR] ", errorMsg);
+            return 0;
+        }
+
+        volumes[i] = v;
+        sumVol += v;
+    }
+
+    // Add the flooring leftover (floored to step) to the first level having the
+    // largest ratio (deterministic: lowest index wins on ties).
+    double leftover = MathFloor((cmd.lot_size - sumVol) / step + 1e-9) * step;
+    if(leftover > 1e-9)
+    {
+        int bestIdx = -1;
+        double bestRatio = -1;
+        for(int i = 0; i < cmd.tp_count; i++)
+        {
+            if(cmd.volume_split[i] > bestRatio)
+            {
+                bestRatio = cmd.volume_split[i];
+                bestIdx = i;
+            }
+        }
+        if(bestIdx >= 0)
+            volumes[bestIdx] = NormalizeDouble(volumes[bestIdx] + leftover, 8);
+    }
+
+    // Normalize entry / SL / every TP to the symbol's digits before OrderOpen.
+    int digits = (int)SymbolInfoInteger(cmd.symbol, SYMBOL_DIGITS);
+    double entryN = NormalizeDouble(cmd.price, digits);
+    double slN    = (cmd.sl > 0) ? NormalizeDouble(cmd.sl, digits) : cmd.sl;
+    double tpN[MAX_SPLITS];
+    for(int i = 0; i < MAX_SPLITS; i++)
+        tpN[i] = (i < cmd.tp_count) ? NormalizeDouble(cmd.tp_levels[i], digits) : 0;
 
     // Create a compact, unique group ID. Kept short so it fits inside the MT5
     // order comment (brokers truncate long comments, which used to silently
@@ -476,20 +634,32 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     // Create split order group
     int groupIndex = ArraySize(orderGroups);
     ArrayResize(orderGroups, groupIndex + 1);
-    orderGroups[groupIndex].groupId = groupId;
+    orderGroups[groupIndex].groupId     = groupId;
+    orderGroups[groupIndex].count       = cmd.tp_count;
     orderGroups[groupIndex].tp2_reached = false;
-    orderGroups[groupIndex].entry_price = cmd.price;
-    orderGroups[groupIndex].symbol = cmd.symbol;
-    orderGroups[groupIndex].order_type = orderType;
-    for(int t = 0; t < 5; t++)
-        orderGroups[groupIndex].tp_prices[t] = cmd.tp_levels[t];
+    orderGroups[groupIndex].entry_price = entryN;
+    orderGroups[groupIndex].symbol      = cmd.symbol;
+    orderGroups[groupIndex].order_type  = orderType;
+    for(int t = 0; t < MAX_SPLITS; t++)
+    {
+        orderGroups[groupIndex].tickets[t]   = 0;
+        // Record the normalized TP for placed/failed levels; 0 for skipped
+        // (volume 0) and the unused tail so drawing/trailing ignore them.
+        orderGroups[groupIndex].tp_prices[t] = (t < cmd.tp_count && volumes[t] > 0) ? tpN[t] : 0;
+    }
 
-    // Place 5 separate orders
+    // Place the split orders (skip levels whose split floored to 0 volume)
     int successCount = 0;
     ulong firstTicket = 0;
 
-    for(int i = 0; i < 5; i++)
+    for(int i = 0; i < cmd.tp_count; i++)
     {
+        if(volumes[i] <= 0)
+        {
+            Print("[SKIP] Split level ", i+1, "/", cmd.tp_count, " skipped (volume_split=0)");
+            continue;
+        }
+
         // Functional comment only: "<groupId>#<tpIndex>". No free-text prefix,
         // so the group/index tokens can't be pushed out by comment truncation.
         string orderComment = StringFormat("%s#%d", groupId, i+1);
@@ -499,9 +669,9 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
             orderType,
             volumes[i],
             0,
-            cmd.price,
-            cmd.sl,
-            cmd.tp_levels[i],
+            entryN,
+            slN,
+            tpN[i],
             ORDER_TIME_GTC,
             0,
             orderComment
@@ -514,14 +684,14 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 
             if(firstTicket == 0) firstTicket = ticket;
 
-            Print("[OK] Split order ", i+1, "/5 placed - Ticket: ", ticket,
-                  " | Vol: ", volumes[i], " | TP", i+1, ": ", cmd.tp_levels[i]);
+            Print("[OK] Split order ", i+1, "/", cmd.tp_count, " placed - Ticket: ", ticket,
+                  " | Vol: ", volumes[i], " | TP", i+1, ": ", tpN[i]);
             successCount++;
         }
         else
         {
             errorMsg = trade.ResultRetcodeDescription();
-            Print("[ERR] Split order ", i+1, "/5 failed - ", errorMsg);
+            Print("[ERR] Split order ", i+1, "/", cmd.tp_count, " failed - ", errorMsg);
             orderGroups[groupIndex].tickets[i] = 0;
         }
     }
@@ -535,9 +705,10 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     }
 
     // Draw TP levels on chart (once for the group) using the ACTUAL TP prices
-    DrawTPLevels(groupId, cmd.symbol, cmd.price, orderGroups[groupIndex].tp_prices);
+    // and the ACTUAL per-level volumes.
+    DrawTPLevels(groupId, cmd.symbol, entryN, orderGroups[groupIndex].tp_prices, volumes, cmd.tp_count);
 
-    Print("[OK] Order group placed: ", successCount, "/5 orders successful");
+    Print("[OK] Order group placed: ", successCount, "/", cmd.tp_count, " orders successful");
     return firstTicket;  // Return first ticket as reference
 }
 
@@ -545,16 +716,16 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
 //+------------------------------------------------------------------+
 //| Draw TP levels on chart                                           |
 //+------------------------------------------------------------------+
-void DrawTPLevels(string groupId, string symbol, double entryPrice, double &tpPrices[])
+void DrawTPLevels(string groupId, string symbol, double entryPrice, double &tpPrices[], double &volumes[], int count)
 {
-    color levelColors[5] = {clrLime, clrGreen, clrYellow, clrOrange, clrRed};
+    // 10-entry palette so every possible split level gets a distinct color.
+    color levelColors[MAX_SPLITS] = {clrLime, clrGreen, clrYellow, clrOrange, clrRed,
+                                     clrDeepPink, clrAqua, clrMagenta, clrGold, clrTomato};
 
-    string percentages[5] = {"60%", "10%", "10%", "10%", "10%"};
-
-    for(int i = 0; i < 5; i++)
+    for(int i = 0; i < count; i++)
     {
         double tpPrice = tpPrices[i];
-        if(tpPrice <= 0) continue;  // TP already closed / unknown - skip drawing
+        if(tpPrice <= 0) continue;  // TP already closed / skipped / unknown - skip drawing
 
         // Create horizontal line
         string lineName = StringFormat("TP%d_Line_%s", i+1, groupId);
@@ -565,10 +736,10 @@ void DrawTPLevels(string groupId, string symbol, double entryPrice, double &tpPr
         ObjectSetInteger(0, lineName, OBJPROP_BACK, false);
         ObjectSetInteger(0, lineName, OBJPROP_SELECTABLE, false);
 
-        // Create text label
+        // Create text label (shows the ACTUAL per-level volume)
         string labelName = StringFormat("TP%d_Label_%s", i+1, groupId);
         ObjectCreate(0, labelName, OBJ_TEXT, 0, TimeCurrent(), tpPrice);
-        ObjectSetString(0, labelName, OBJPROP_TEXT, StringFormat("  TP%d: %.3f (%s)", i+1, tpPrice, percentages[i]));
+        ObjectSetString(0, labelName, OBJPROP_TEXT, StringFormat("  TP%d: %.3f (%.2f lots)", i+1, tpPrice, volumes[i]));
         ObjectSetInteger(0, labelName, OBJPROP_COLOR, levelColors[i]);
         ObjectSetInteger(0, labelName, OBJPROP_FONTSIZE, 9);
         ObjectSetString(0, labelName, OBJPROP_FONT, "Arial Bold");
@@ -624,8 +795,9 @@ void UpdateTPLevelClosed(string groupId, int level)
 //+------------------------------------------------------------------+
 void RemoveTPObjects(string groupId)
 {
-    // Remove TP lines and labels
-    for(int i = 1; i <= 5; i++)
+    // Remove TP lines and labels. Loop the full capacity so recovered or
+    // legacy groups (whose real count is unknown here) are fully cleaned.
+    for(int i = 1; i <= MAX_SPLITS; i++)
     {
         ObjectDelete(0, StringFormat("TP%d_Line_%s", i, groupId));
         ObjectDelete(0, StringFormat("TP%d_Label_%s", i, groupId));
@@ -645,19 +817,16 @@ void CheckTP2ForTrailingSL()
 {
     for(int i = ArraySize(orderGroups) - 1; i >= 0; i--)
     {
-        // Skip if TP2 trailing already applied for this group
-        if(orderGroups[i].tp2_reached)
-        {
-            continue;
-        }
-
-        // Check if TP2 position (ticket index 1) has closed
         ulong tp2_ticket = orderGroups[i].tickets[1];
 
-        if(tp2_ticket == 0) continue;  // Invalid ticket
-
-        // Check if TP2 position no longer exists (was closed by hitting TP)
-        if(!PositionSelectByTicket(tp2_ticket))
+        // Trailing trigger: TP2 must have been placed (ticket > 0), must no
+        // longer be a pending order (it filled), and must no longer be an
+        // open position (it closed). Checking positions alone misfired for
+        // pending groups: a stop order that has not filled yet is NOT a
+        // position, so TP2 looked "closed" one tick after placement and the
+        // group's tracking self-destructed before any order ever filled.
+        if(!orderGroups[i].tp2_reached && tp2_ticket > 0 &&
+           !OrderSelect(tp2_ticket) && !PositionSelectByTicket(tp2_ticket))
         {
             // TP2 was hit! Move SL to TP1 for all remaining positions
             Print("[HIT] TP2 reached for group ", orderGroups[i].groupId, " - Moving SL to TP1 for all remaining positions");
@@ -668,9 +837,9 @@ void CheckTP2ForTrailingSL()
             double newSL = orderGroups[i].tp_prices[0];
             if(newSL <= 0) newSL = orderGroups[i].entry_price;
 
-            // Update SL for all remaining positions (TP3, TP4, TP5)
+            // Update SL for all remaining positions (TP3..count)
             int movedCount = 0;
-            for(int j = 2; j < 5; j++)  // Start from index 2 (TP3)
+            for(int j = 2; j < orderGroups[i].count; j++)  // Start from index 2 (TP3)
             {
                 ulong ticket = orderGroups[i].tickets[j];
                 if(ticket == 0) continue;
@@ -715,21 +884,24 @@ void CheckTP2ForTrailingSL()
             UpdateTPLevelClosed(orderGroups[i].groupId, 2);
         }
 
-        // Clean up group if all positions closed
-        bool allClosed = true;
-        for(int j = 0; j < 5; j++)
+        // Clean up the group only when NOTHING is alive on any level: neither
+        // an open position nor a still-pending order. This runs for every
+        // group (including tp2_reached ones, which previously leaked forever,
+        // and skipped-TP2 / single-level groups).
+        bool anyAlive = false;
+        for(int j = 0; j < orderGroups[i].count; j++)
         {
             ulong ticket = orderGroups[i].tickets[j];
-            if(ticket > 0 && PositionSelectByTicket(ticket))
+            if(ticket > 0 && (OrderSelect(ticket) || PositionSelectByTicket(ticket)))
             {
-                allClosed = false;
+                anyAlive = true;
                 break;
             }
         }
 
-        if(allClosed)
+        if(!anyAlive)
         {
-            Print("[END] All positions closed for group ", orderGroups[i].groupId);
+            Print("[END] All orders/positions closed for group ", orderGroups[i].groupId);
             RemoveTPObjects(orderGroups[i].groupId);
             ArrayRemove(orderGroups, i, 1);
         }
@@ -782,13 +954,21 @@ bool CheckDailyLossLimit()
 //+------------------------------------------------------------------+
 bool ParseGroupComment(string comment, string &groupId, int &tpLevel)
 {
-    // New compact format: "<groupId>#<idx>"
+    // New compact format: "<groupId>#<idx>". Read ALL consecutive digits after
+    // '#' so two-digit indices (e.g. "#10") parse correctly.
     int hashPos = StringFind(comment, "#");
     if(hashPos > 0)
     {
         groupId = StringSubstr(comment, 0, hashPos);
-        tpLevel = (int)StringToInteger(StringSubstr(comment, hashPos + 1, 1));
-        if(tpLevel >= 1 && tpLevel <= 5) return true;
+        int p = hashPos + 1;
+        while(p < StringLen(comment))
+        {
+            ushort ch = StringGetCharacter(comment, p);
+            if(ch < '0' || ch > '9') break;
+            p++;
+        }
+        tpLevel = (int)StringToInteger(StringSubstr(comment, hashPos + 1, p - (hashPos + 1)));
+        if(tpLevel >= 1 && tpLevel <= MAX_SPLITS) return true;
     }
 
     // Legacy format: "...|GROUP:<groupId>|TP:<idx>"
@@ -799,8 +979,15 @@ bool ParseGroupComment(string comment, string &groupId, int &tpLevel)
         if(tpPos >= 0)
         {
             groupId = StringSubstr(comment, gPos + 7, tpPos - gPos - 7);
-            tpLevel = (int)StringToInteger(StringSubstr(comment, tpPos + 4, 1));
-            if(tpLevel >= 1 && tpLevel <= 5) return true;
+            int p = tpPos + 4;
+            while(p < StringLen(comment))
+            {
+                ushort ch = StringGetCharacter(comment, p);
+                if(ch < '0' || ch > '9') break;
+                p++;
+            }
+            tpLevel = (int)StringToInteger(StringSubstr(comment, tpPos + 4, p - (tpPos + 4)));
+            if(tpLevel >= 1 && tpLevel <= MAX_SPLITS) return true;
         }
     }
 
@@ -818,10 +1005,13 @@ int FindOrCreateGroup(string groupId)
     int idx = ArraySize(orderGroups);
     ArrayResize(orderGroups, idx + 1);
     orderGroups[idx].groupId = groupId;
+    // Recovered groups don't know their original level count, so use the full
+    // capacity and rely on ticket==0 / tp_price<=0 guards to skip empty slots.
+    orderGroups[idx].count = MAX_SPLITS;
     orderGroups[idx].tp2_reached = false;
     orderGroups[idx].entry_price = 0;
     orderGroups[idx].symbol = "";
-    for(int t = 0; t < 5; t++)
+    for(int t = 0; t < MAX_SPLITS; t++)
     {
         orderGroups[idx].tickets[t] = 0;
         orderGroups[idx].tp_prices[t] = 0;
@@ -897,11 +1087,12 @@ void RecoverSplitOrders()
     // Post-process: infer TP2-reached state and redraw visuals.
     for(int g = 0; g < groupCount; g++)
     {
-        // TP2 was already hit if its ticket is gone but a later TP survives.
-        if(orderGroups[g].tickets[1] == 0 &&
-           (orderGroups[g].tickets[2] > 0 ||
-            orderGroups[g].tickets[3] > 0 ||
-            orderGroups[g].tickets[4] > 0))
+        // TP2 was already hit if its ticket is gone but any later TP survives.
+        bool laterAlive = false;
+        for(int t = 2; t < MAX_SPLITS; t++)
+            if(orderGroups[g].tickets[t] > 0) { laterAlive = true; break; }
+
+        if(orderGroups[g].tickets[1] == 0 && laterAlive)
         {
             orderGroups[g].tp2_reached = true;
             Print("   [HIT] TP2 already reached for group ", orderGroups[g].groupId);
@@ -909,11 +1100,23 @@ void RecoverSplitOrders()
 
         if(orderGroups[g].entry_price > 0)
         {
+            // Read back the actual live volume of each surviving split so the
+            // chart labels are correct after recovery.
+            double vols[MAX_SPLITS];
+            for(int t = 0; t < MAX_SPLITS; t++)
+            {
+                vols[t] = 0;
+                ulong tk = orderGroups[g].tickets[t];
+                if(tk == 0) continue;
+                if(PositionSelectByTicket(tk))      vols[t] = PositionGetDouble(POSITION_VOLUME);
+                else if(OrderSelect(tk))            vols[t] = OrderGetDouble(ORDER_VOLUME_CURRENT);
+            }
+
             DrawTPLevels(orderGroups[g].groupId, orderGroups[g].symbol,
-                         orderGroups[g].entry_price, orderGroups[g].tp_prices);
+                         orderGroups[g].entry_price, orderGroups[g].tp_prices, vols, orderGroups[g].count);
 
             // Mark already-closed TPs as gray.
-            for(int t = 0; t < 5; t++)
+            for(int t = 0; t < orderGroups[g].count; t++)
                 if(orderGroups[g].tickets[t] == 0)
                     UpdateTPLevelClosed(orderGroups[g].groupId, t + 1);
 
@@ -1070,10 +1273,12 @@ string HandleClosePosition(string commandJson)
             {
                 if(orderGroups[i].groupId == groupId)
                 {
-                    for(int j = 0; j < 5; j++)
+                    for(int j = 0; j < orderGroups[i].count; j++)
                     {
+                        // Alive = still-pending order OR open position; a
+                        // pending sibling must block the group cleanup.
                         ulong checkTicket = orderGroups[i].tickets[j];
-                        if(checkTicket > 0 && PositionSelectByTicket(checkTicket))
+                        if(checkTicket > 0 && (OrderSelect(checkTicket) || PositionSelectByTicket(checkTicket)))
                         {
                             allClosed = false;
                             break;
@@ -1135,8 +1340,8 @@ string HandleSafeShutdown()
 
         int modifiedInGroup = 0;
 
-        // Modify TP2, TP3, TP4, TP5 (indices 1-4)
-        for(int j = 1; j < 5; j++)
+        // Consolidate levels 2..count (indices 1..count-1) onto TP2's price.
+        for(int j = 1; j < orderGroups[i].count; j++)
         {
             ulong ticket = orderGroups[i].tickets[j];
             if(ticket == 0) continue;

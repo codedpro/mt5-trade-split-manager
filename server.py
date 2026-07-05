@@ -18,7 +18,7 @@ import queue
 import time
 
 from fastapi import FastAPI, HTTPException, Header, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from typing import List, Optional
 import uvicorn
 
@@ -45,7 +45,7 @@ print(f"✅ Config loaded - TCP Server will listen on {TCP_HOST}:{TCP_PORT}")
 if not API_KEY and HTTP_HOST != '127.0.0.1':
     print("⚠️  WARNING: HOST is not localhost and API_KEY is unset - the trading API is UNAUTHENTICATED.")
 
-app = FastAPI(title="MT5 TCP Bridge", version="4.1.0")
+app = FastAPI(title="MT5 TCP Bridge", version="4.2.0")
 
 
 class OrderCommand(BaseModel):
@@ -55,11 +55,50 @@ class OrderCommand(BaseModel):
     price: float
     sl: float
     tp_levels: List[float]
+    volume_split: Optional[List[float]] = None
     lot_size: float = 0.1
     deviation: int = 3
     comment: str = "Claude AI"
     magic_number: int = 20250117
     partial_close_percent: float = 20.0
+
+    @field_validator("tp_levels")
+    @classmethod
+    def _validate_tp_levels(cls, v: List[float]) -> List[float]:
+        if not 1 <= len(v) <= 10:
+            raise ValueError(f"tp_levels must contain 1 to 10 prices (got {len(v)})")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_volume_split(self) -> "OrderCommand":
+        # An omitted split is filled in with the default at send time.
+        if self.volume_split is None:
+            return self
+        split = self.volume_split
+        if len(split) != len(self.tp_levels):
+            raise ValueError(
+                f"volume_split length ({len(split)}) must match tp_levels "
+                f"length ({len(self.tp_levels)})"
+            )
+        if any(x < 0 for x in split):
+            raise ValueError("volume_split entries must all be >= 0")
+        if not any(x > 0 for x in split):
+            raise ValueError("volume_split must have at least one entry > 0")
+        total = sum(split)
+        if not 0.99 <= total <= 1.01:
+            raise ValueError(
+                f"volume_split must sum to ~1.0 within [0.99, 1.01] (got {total:.4f})"
+            )
+        return self
+
+
+def default_volume_split(n: int) -> List[float]:
+    """Legacy-compatible default split for N levels: N=1 -> [1.0]; otherwise
+    TP1 = 0.60 and each remaining level = 0.40 / (N-1). For N=5 this is the
+    original 60/10/10/10/10 weighting, so existing clients are unchanged."""
+    if n == 1:
+        return [1.0]
+    return [0.60] + [0.40 / (n - 1)] * (n - 1)
 
 
 class Envelope:
@@ -196,7 +235,12 @@ async def health():
 
 @app.post("/order", dependencies=[Depends(require_key)])
 async def create_order(order: OrderCommand):
-    """Place order on MT5 via TCP (split into 5 positions by the EA)."""
+    """Place order on MT5 via TCP (split into 1-10 positions by the EA)."""
+    # The command sent to the EA always carries an explicit volume_split; when
+    # the client omits it we inject the legacy-compatible default here.
+    volume_split = order.volume_split
+    if volume_split is None:
+        volume_split = default_volume_split(len(order.tp_levels))
     command = {
         "action": "PLACE_ORDER",
         "data": {
@@ -205,6 +249,7 @@ async def create_order(order: OrderCommand):
             "price": order.price,
             "sl": order.sl,
             "tp_levels": order.tp_levels,
+            "volume_split": volume_split,
             "lot_size": order.lot_size,
             "deviation": order.deviation,
             "comment": order.comment,

@@ -1,13 +1,14 @@
 # MT5 Trade Split Manager 🤖
 
 [![Compile EA](https://github.com/codedpro/mt5-trade-split-manager/actions/workflows/compile-ea.yml/badge.svg)](https://github.com/codedpro/mt5-trade-split-manager/actions/workflows/compile-ea.yml)
+[![Python tests](https://github.com/codedpro/mt5-trade-split-manager/actions/workflows/ci-python.yml/badge.svg)](https://github.com/codedpro/mt5-trade-split-manager/actions/workflows/ci-python.yml)
 [![MetaTrader 5](https://img.shields.io/badge/MetaTrader-5-blue.svg)](https://www.metatrader5.com/)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109.0-green.svg)](https://fastapi.tiangolo.com/)
 [![AI Agent Friendly](https://img.shields.io/badge/AI%20Agent-Friendly-brightgreen.svg)](https://claude.ai)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**🤖 AI-Agent Friendly** | **Professional-grade MetaTrader 5 Expert Advisor with intelligent order splitting, automatic trailing stop loss, and REST API integration for Gold (XAUUSD) and Silver (XAGUSD) trading. Built for seamless integration with Claude AI and other AI agents.**
+**🤖 AI-Agent Friendly** | **Professional-grade MetaTrader 5 Expert Advisor with intelligent order splitting, automatic trailing stop loss, and REST API integration for any MT5 symbol (Gold/XAUUSD and Silver/XAGUSD included as examples). Ships with a Model Context Protocol (MCP) server for native Claude integration and other AI agents.**
 
 ## 🤖 Why AI-Agent Friendly?
 
@@ -29,15 +30,16 @@ System: Splits order → Manages positions → Returns status
 
 ## 🚀 Key Features
 
-- ✅ **Automatic Order Splitting** - Splits single order into 5 positions with optimized volume distribution (60%, 10%, 10%, 10%, 10%)
+- ✅ **Automatic Order Splitting** - Splits a single order into 1-10 positions with configurable volume distribution (defaults to 60/10/10/10/10 for 5 levels)
 - ✅ **Smart Trailing Stop Loss** - Automatically moves SL to breakeven when TP2 is reached
 - ✅ **Dual TP Structures** - Supports both 15-pip and 30-pip initial TP configurations
 - ✅ **Safe Shutdown Mode** - Protects positions when EA is offline
 - ✅ **REST API Integration** - FastAPI server for external signal processing
+- ✅ **MCP Server** - Native Model Context Protocol server so Claude Code / Claude Desktop can inspect and control MT5 directly
 - ✅ **TCP Socket Communication** - High-performance bidirectional communication
 - ✅ **Order Type Safety** - Validates STOP/LIMIT (and SL/TP sides) against the live market and **rejects** wrong-side orders instead of silently reinterpreting your intent
 - ✅ **Position Recovery** - Rebuilds tracking from existing orders on restart
-- ✅ **Multi-Symbol Support** - Optimized for Gold (XAUUSD) and Silver (XAGUSD)
+- ✅ **Any-Symbol Support** - Works on any MT5 symbol; volumes snap to the broker's lot step and prices normalize to the symbol's digits (Gold/XAUUSD and Silver/XAGUSD are examples, not limits)
 - ✅ **Risk Management** - Daily loss limits, max positions, spread checks
 - ✅ **AI Agent Ready** - Perfect for Claude AI, ChatGPT, and automation workflows
 
@@ -49,6 +51,7 @@ System: Splits order → Manages positions → Returns status
 - [Trailing Stop Logic](#-trailing-stop-logic)
 - [Safe Shutdown Mode](#-safe-shutdown-mode)
 - [API Documentation](#-api-documentation)
+- [MCP Server](#-mcp-server)
 - [Configuration](#-configuration)
 - [Installation](#-installation)
 - [Usage Examples](#-usage-examples)
@@ -133,11 +136,19 @@ Traditional single-TP orders force you to choose between:
 - Taking profit early (leaving money on the table)
 - Holding for larger profit (risking reversal)
 
-**Solution**: Split one order into 5 positions with different TPs!
+**Solution**: Split one order into **1 to 10 positions**, each with its own TP!
 
 ### Volume Distribution
 
-When you place 0.1 lot, the EA creates 5 separate orders:
+You choose how many TP levels to send (1-10). If you don't send a `volume_split`,
+the EA/server apply a default weighting:
+
+- **1 level** → the whole lot goes to that single TP (`[1.0]`).
+- **N ≥ 2 levels** → TP1 gets **60%** and the remaining **40%** is shared evenly
+  across the other `N-1` levels. For **5 levels** this reproduces the original
+  **60/10/10/10/10** distribution exactly, so existing 5-level clients are unchanged.
+
+When you place 0.1 lot with the default 5-level split, the EA creates 5 separate orders:
 
 | Order | Volume | % of Total | Take Profit | Purpose |
 |-------|--------|------------|-------------|---------|
@@ -146,6 +157,34 @@ When you place 0.1 lot, the EA creates 5 separate orders:
 | TP3   | 0.01   | 10%        | 75 pips     | Medium-term profit |
 | TP4   | 0.01   | 10%        | 105 pips    | Extended profit |
 | TP5   | 0.01   | 10%        | 135 pips    | Maximum profit target |
+
+### Custom Volume Distribution
+
+Send an optional `volume_split` array (one fraction per TP level) to override the
+default. The rules are validated on both the server (422 on failure) and the EA:
+
+- **Same length** as `tp_levels`.
+- **Each entry ≥ 0**, with **at least one entry > 0**.
+- **Sum ≈ 1.0** (accepted within `[0.99, 1.01]`).
+- **A `0` entry skips that level** — no order is placed for it. This lets you keep
+  a fixed 5-level TP ladder but only actually fill, say, TP1 and TP3.
+
+**Example — a 3-level 50/30/20 split:**
+
+```json
+"tp_levels": [4103.0, 4106.0, 4109.0],
+"volume_split": [0.5, 0.3, 0.2]
+```
+
+### Lot-Step Rounding
+
+Each per-level volume is `lot_size × ratio`, **floored down to the broker's lot
+step** (`SYMBOL_VOLUME_STEP`). Any rounding leftover is added back to the level with
+the largest ratio so the totals still add up. If a non-zero level would floor to
+**below the broker's minimum lot** (`SYMBOL_VOLUME_MIN`), the whole order is
+**rejected** with a message naming the offending level and the smallest `lot_size`
+that would make it viable — the EA never silently drops a leg. Entry, SL, and every
+TP price are normalized to the symbol's digit precision before the order is sent.
 
 ### TP Structure Options
 
@@ -163,11 +202,17 @@ When you place 0.1 lot, the EA creates 5 separate orders:
 - TP4: 120 pips (+30)
 - TP5: 150 pips (+30)
 
-### Pip Value Calibration
+### Any Symbol, Correct Precision
 
-The EA automatically adjusts pip values based on symbol:
-- **Gold (XAUUSD)**: 1 pip = 0.10 (e.g., 2650.00 → 2651.00)
-- **Silver (XAGUSD)**: 1 pip = 0.01 (e.g., 29.50 → 29.51)
+Because you send **absolute TP/SL/entry prices** (not pip offsets), the system is
+not tied to any particular instrument. The EA reads the symbol's own volume step,
+minimum lot, and digit precision from MT5, so the same request format works on FX
+pairs, metals, indices, or crypto CFDs — whatever your broker exposes.
+
+The pip figures used throughout these examples are just conveniences for the two
+symbols the project was first built around:
+- **Gold (XAUUSD)**: 1 pip ≈ 0.10 (e.g., 2650.00 → 2651.00)
+- **Silver (XAGUSD)**: 1 pip ≈ 0.01 (e.g., 29.50 → 29.51)
 
 ## 🎢 Trailing Stop Logic
 
@@ -317,12 +362,13 @@ Place a new order with automatic splitting.
 ```
 
 **Parameters:**
-- `symbol` (string): Trading symbol ("XAUUSD" or "XAGUSD")
+- `symbol` (string): Any MT5 symbol your broker exposes (e.g. "XAUUSD", "XAGUSD", "EURUSD", "BTCUSD")
 - `order_type` (string): "BUY_STOP", "SELL_STOP", "BUY_LIMIT", or "SELL_LIMIT". The price must be on the correct side of the market for the type (e.g. BUY_STOP above the ask); wrong-side requests are rejected with an explanatory message rather than converted.
 - `price` (float): Entry price
 - `sl` (float): Stop loss price
-- `tp_levels` (array): 5 take profit levels
-- `lot_size` (float): Total volume (will be split into 5 orders)
+- `tp_levels` (array): **1 to 10** take-profit prices (must be on the correct side of entry)
+- `volume_split` (array, optional): Fractions of `lot_size`, one per TP level. Same length as `tp_levels`, each entry ≥ 0, at least one > 0, and they must sum to ~1.0 (within `[0.99, 1.01]`). A `0` entry skips that level. Omit to use the default 60/40 split (60/10/10/10/10 for 5 levels).
+- `lot_size` (float): Total volume, split across the TP levels (floored to the broker's lot step; rejected if a non-zero leg would fall below the broker minimum)
 - `deviation` (int, optional): Maximum price deviation in pips
 - `comment` (string, optional): Order comment
 - `magic_number` (int, optional): Magic number for identification
@@ -335,6 +381,27 @@ Place a new order with automatic splitting.
   "ticket": 171645717
 }
 ```
+
+**Example — custom 3-level split (50/30/20):**
+
+```bash
+curl -X POST http://localhost:8080/order \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "EURUSD",
+    "order_type": "BUY_LIMIT",
+    "price": 1.0850,
+    "sl": 1.0820,
+    "tp_levels": [1.0880, 1.0910, 1.0940],
+    "volume_split": [0.5, 0.3, 0.2],
+    "lot_size": 0.3
+  }'
+```
+
+This places 0.15 lots @ 1.0880, 0.09 lots @ 1.0910, and 0.06 lots @ 1.0940
+(subject to the broker's lot step). Validation failures — bad length, wrong sum,
+negative or all-zero splits, more than 10 levels — return `422` with a message
+naming the rule that was broken.
 
 #### 3. Get Positions
 
@@ -455,6 +522,84 @@ Activate safe shutdown mode - consolidate all TPs to TP2 level.
   "open_positions_modified": 8
 }
 ```
+
+## 🧩 MCP Server
+
+The repo ships an optional **Model Context Protocol (MCP)** server (`mcp_server.py`)
+that wraps the REST bridge as tools an LLM client can call natively. With it,
+Claude Code or Claude Desktop can list your positions, read account stats, and
+(optionally) place and manage split orders — no manual `curl` required.
+
+It talks to the same running `server.py` bridge over HTTP, so start the bridge
+first (and point the MCP server at it if it isn't on the default URL).
+
+### Install
+
+```bash
+pip install -r requirements-mcp.txt
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MT5_BRIDGE_URL` | `http://127.0.0.1:8080` | Base URL of the running `server.py` bridge |
+| `MT5_API_KEY` | *(unset)* | Sent as `X-API-Key` on every request; set it to match the bridge's `API_KEY` |
+| `MT5_MCP_ENABLE_TRADING` | *(off)* | Set to `1` or `true` to register the trading tools. **Left off by default so a fresh install cannot move money.** |
+
+### Tools
+
+**Read-only (always available):**
+- `list_positions` — all open positions (filled legs of split orders)
+- `list_pending_orders` — pending stop/limit legs price hasn't reached yet
+- `account_stats` — balance, equity, margin, free margin, open profit
+- `bridge_health` — check the bridge is up and whether auth is required
+
+**Trading (only when `MT5_MCP_ENABLE_TRADING=1`):**
+- `place_split_order` — mirror of `POST /order`, including `volume_split`
+- `close_position` — close an open position by ticket
+- `cancel_order` — cancel a pending order by ticket
+- `safe_shutdown` — consolidate remaining TP legs to the TP2 level
+
+Responses are the bridge's JSON passed straight through; connection/HTTP failures
+come back as short, readable messages instead of raw tracebacks.
+
+### Setup — Claude Code
+
+```bash
+claude mcp add mt5 \
+  --env MT5_BRIDGE_URL=http://127.0.0.1:8080 \
+  --env MT5_MCP_ENABLE_TRADING=1 \
+  -- python /path/to/mt5-trade-split-manager/mcp_server.py
+```
+
+Drop the `MT5_MCP_ENABLE_TRADING` line to keep the connection read-only. Add
+`--env MT5_API_KEY=your-secret` if the bridge runs with `API_KEY` set.
+
+### Setup — Claude Desktop
+
+Add an entry to your `claude_desktop_config.json` (Settings → Developer → Edit Config):
+
+```json
+{
+  "mcpServers": {
+    "mt5": {
+      "command": "python",
+      "args": ["/path/to/mt5-trade-split-manager/mcp_server.py"],
+      "env": {
+        "MT5_BRIDGE_URL": "http://127.0.0.1:8080",
+        "MT5_MCP_ENABLE_TRADING": "1"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop after editing. Omit `MT5_MCP_ENABLE_TRADING` for a
+read-only connection, and add `MT5_API_KEY` under `env` if the bridge requires it.
+
+> ⚠️ Enabling the trading tools lets the model place and close **real** orders.
+> Keep it off unless you intend that, and always demo-test first.
 
 ## ⚙️ Configuration
 
@@ -579,13 +724,34 @@ curl -X POST http://localhost:8080/order \
   }'
 ```
 
-### Example 3: Check All Positions
+### Example 3: Any Symbol with a Custom 3-Level Split
+
+```bash
+curl -X POST http://localhost:8080/order \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "EURUSD",
+    "order_type": "BUY_LIMIT",
+    "price": 1.0850,
+    "sl": 1.0820,
+    "tp_levels": [1.0880, 1.0910, 1.0940],
+    "volume_split": [0.5, 0.3, 0.2],
+    "lot_size": 0.3
+  }'
+```
+
+This creates 3 orders (volumes floored to the broker's lot step):
+- 0.15 lots @ TP 1.0880 (50%)
+- 0.09 lots @ TP 1.0910 (30%)
+- 0.06 lots @ TP 1.0940 (20%)
+
+### Example 4: Check All Positions
 
 ```bash
 curl http://localhost:8080/positions
 ```
 
-### Example 4: Activate Safe Shutdown
+### Example 5: Activate Safe Shutdown
 
 ```bash
 curl -X POST http://localhost:8080/safe-shutdown
@@ -662,13 +828,13 @@ python server.py
 ## ❓ FAQ
 
 **Q: Can I use this with other symbols besides Gold and Silver?**
-A: The code is optimized for XAUUSD and XAGUSD pip values. For other symbols, you'll need to adjust the `pipValue` calculation in the MQL5 code.
+A: Yes. You send absolute TP/SL/entry prices, and the EA reads each symbol's volume step, minimum lot, and digit precision directly from MT5, so any broker symbol works (FX pairs, metals, indices, crypto CFDs). XAUUSD/XAGUSD are just the examples this project started with.
 
 **Q: What happens if I restart MT5 while positions are open?**
 A: The EA has position recovery logic that rebuilds order group tracking from position comments. However, trailing SL won't trigger during the restart period.
 
 **Q: Can I change the volume distribution (60/10/10/10/10)?**
-A: Yes, edit the `volumes[]` array in the `ExecuteOrder()` function in bulk-add-signals.mq5.
+A: Yes — send a `volume_split` array in the API request (see [Split Order System](#-split-order-system)). No code editing required; the 60/40 default is only applied when you omit it. You can also use 1-10 levels instead of exactly 5.
 
 **Q: Does this work on MT4?**
 A: No, this is specifically designed for MT5. MT4 uses a different API and doesn't support the same socket operations.
@@ -683,7 +849,7 @@ A: Currently, the system uses a REST API. You can build a web frontend that call
 A: The EA uses socket communication which isn't available in Strategy Tester. For backtesting, you'd need to modify the code to use simulated data instead of TCP sockets.
 
 **Q: What's the minimum lot size?**
-A: Depends on your broker. Since orders are split into 0.01 lot increments, your broker must support 0.01 lots (micro lots).
+A: Depends on your broker. Each split leg is floored to the broker's lot step (`SYMBOL_VOLUME_STEP`), and if a non-zero leg would land below the broker minimum (`SYMBOL_VOLUME_MIN`) the whole order is rejected with a message telling you the smallest `lot_size` that would make that level viable.
 
 ## 📄 License
 
@@ -711,9 +877,11 @@ Contributions welcome! Please:
 
 ## 🎯 Roadmap
 
+- [x] Support for additional symbols (any MT5 symbol, broker-driven lot step & precision)
+- [x] Configurable 1-10 level splits with custom `volume_split`
+- [x] MCP server for native Claude Code / Claude Desktop integration
 - [ ] Web-based dashboard for monitoring positions
 - [ ] Telegram bot integration for alerts
-- [ ] Support for additional symbols
 - [ ] Advanced risk management presets
 - [ ] Trade journal and analytics
 - [ ] Multi-account support
@@ -728,4 +896,4 @@ Contributions welcome! Please:
 
 **Made with ❤️ for algorithmic traders**
 
-**Keywords:** MetaTrader 5, MT5, Expert Advisor, EA, Gold Trading, XAUUSD, Silver Trading, XAGUSD, Forex Bot, Trading Bot, Algorithmic Trading, Automated Trading, Split Orders, Trailing Stop, Risk Management, FastAPI, Python Trading, MQL5, Trading API, REST API, Socket Trading
+**Keywords:** MetaTrader 5, MT5, Expert Advisor, EA, Gold Trading, XAUUSD, Silver Trading, XAGUSD, Forex Bot, Trading Bot, Algorithmic Trading, Automated Trading, Split Orders, Trailing Stop, Risk Management, FastAPI, Python Trading, MQL5, Trading API, REST API, Socket Trading, MCP, Model Context Protocol, Claude MCP, AI Trading Agent
