@@ -1,0 +1,43 @@
+name: Python tests
+
+# Unit-tests the FastAPI/TCP bridge (server.py) and the MCP wrapper with pytest
+# so a change that breaks the API contract, request routing, timeout/abandon
+# handling, or validation can't be merged. The MQL5 EA is guarded separately by
+# compile-ea.yml.
+
+on:
+  push:
+    paths:
+      - "server.py"
+      - "mcp_server.py"
+      - "tests/**"
+      - "requirements*.txt"
+      - ".github/workflows/ci-python.yml"
+  pull_request:
+    paths:
+      - "server.py"
+      - "mcp_server.py"
+      - "tests/**"
+      - "requirements*.txt"
+      - ".github/workflows/ci-python.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
