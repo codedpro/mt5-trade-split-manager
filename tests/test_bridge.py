@@ -291,4 +291,6 @@ def test_legacy_default_split_injected(monkeypatch):
     # The handler injects that default into the command it sends to the EA.
     command = _capture_command(monkeypatch, order)
     assert command["data"]["volume_split"] == [0.6, 0.1, 0.1, 0.1, 0.1]
-    assert sum(command["data"]["volume_split"]) == 1.0
+    # Tolerant float check: naive summation (Python <= 3.11) yields
+    # 0.9999999999999999 while 3.12+ Neumaier summation yields exactly 1.0.
+    assert abs(sum(command["data"]["volume_split"]) - 1.0) < 1e-9
