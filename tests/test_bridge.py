@@ -155,9 +155,12 @@ def test_envelope_correlation_concurrent():
     results = {}
     errors = {}
 
+    # The caller timeout must exceed the fake-EA serve deadline: an abandoned
+    # (timed-out) command can never be served, so if a caller gave up before
+    # the EA got to it, `served` could never reach 2. Keep callers patient.
     def _caller(tag):
         try:
-            results[tag] = server.send_command_to_mt5({"action": "PING", "tag": tag}, timeout=5)
+            results[tag] = server.send_command_to_mt5({"action": "PING", "tag": tag}, timeout=20)
         except Exception as exc:  # noqa: BLE001 - surfaced via the errors dict
             errors[tag] = exc
 
@@ -165,10 +168,10 @@ def test_envelope_correlation_concurrent():
     for thread in threads:
         thread.start()
 
-    served = _fake_ea_serve(count=2, deadline=time.time() + 8)
+    served = _fake_ea_serve(count=2, deadline=time.time() + 15)
 
     for thread in threads:
-        thread.join(timeout=8)
+        thread.join(timeout=20)
 
     assert served == 2, f"fake EA only served {served}/2 commands"
     assert not errors, f"callers raised unexpectedly: {errors}"

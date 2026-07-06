@@ -23,8 +23,8 @@ input string ServerHost = "127.0.0.1";       // Python server host
 input int ServerPort = 5555;                  // Python server port
 input int MagicNumber = 20250117;            // Magic number for orders
 input double DefaultLotSize = 0.1;           // Default lot size
-input int MaxSpreadPips = 10;                // Maximum spread in pips
-input int MaxPositions = 10;                 // Maximum open positions
+input int MaxSpreadPips = 10;                // Max spread in pips (0 disables the check)
+input int MaxPositions = 50;                 // Max open positions + pending orders (combined)
 input double MaxDailyLossPercent = 5.0;      // Max daily loss %
 input int SocketCheckIntervalMs = 500;       // Socket check interval (ms)
 input int SocketTimeout = 3000;              // Socket timeout (ms)
@@ -37,6 +37,7 @@ CAccountInfo account;
 double dailyStartBalance = 0;
 datetime dailyStartDay = 0;    // Start of the current trading day (for daily loss reset)
 int g_groupCounter = 0;        // Monotonic counter to keep group IDs unique
+bool g_groupsDirty = false;    // Set when orderGroups changes; flushed to disk by OnTimer
 
 //--- Structures
 struct TradeCommand {
@@ -81,7 +82,7 @@ int OnInit()
 
     // Store starting balance and current trading day (for daily loss reset)
     dailyStartBalance = account.Balance();
-    dailyStartDay = TimeCurrent() - (TimeCurrent() % 86400);
+    dailyStartDay = BrokerDayStart();
 
     // Recover existing positions for split order tracking
     RecoverSplitOrders();
@@ -105,6 +106,13 @@ void OnDeinit(const int reason)
     Print("==== EA Shutting Down ====");
     EventKillTimer();
 
+    // Persist any pending group-state change before we stop.
+    if(g_groupsDirty)
+    {
+        SaveGroups();
+        g_groupsDirty = false;
+    }
+
     // Clean up all chart objects created by this EA
     for(int i = ArraySize(orderGroups) - 1; i >= 0; i--)
     {
@@ -121,6 +129,13 @@ void OnTimer()
     // the chart's own symbol, so groups on other symbols would otherwise not
     // trail until this chart happened to tick.
     CheckTP2ForTrailingSL();
+
+    // Flush group state to disk when it changed (at most once per timer tick).
+    if(g_groupsDirty)
+    {
+        SaveGroups();
+        g_groupsDirty = false;
+    }
 
     // Create TCP socket
     int socket = SocketCreate();
@@ -483,6 +498,31 @@ bool IsBuyType(ENUM_ORDER_TYPE t)
 }
 
 //+------------------------------------------------------------------+
+//| One pip in price terms for a symbol.                              |
+//| 5/3-digit quotes: 1 pip = 10 points. Everything else (2/4-digit   |
+//| FX, metals, indices): 1 pip = 1 point (the broker's increment).   |
+//| Only used for the spread guard; order prices use real TP values.  |
+//+------------------------------------------------------------------+
+double SymbolPip(string sym)
+{
+    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+    if(point <= 0) return 0;
+    return (digits == 3 || digits == 5) ? point * 10.0 : point;
+}
+
+//+------------------------------------------------------------------+
+//| Start of the current broker trading day (broker midnight), so the |
+//| daily-loss window follows the broker clock, not the server's UTC. |
+//+------------------------------------------------------------------+
+datetime BrokerDayStart()
+{
+    datetime d = iTime(_Symbol, PERIOD_D1, 0);
+    if(d <= 0) d = TimeCurrent() - (TimeCurrent() % 86400);  // fallback if no bar yet
+    return d;
+}
+
+//+------------------------------------------------------------------+
 //| Validate command                                                   |
 //+------------------------------------------------------------------+
 bool ValidateCommand(TradeCommand &cmd)
@@ -502,9 +542,28 @@ bool ValidateCommand(TradeCommand &cmd)
         return false;
     }
 
-    if(CountOpenPositions() >= MaxPositions)
+    // Spread guard: reject when the live spread exceeds MaxSpreadPips.
+    if(MaxSpreadPips > 0)
     {
-        Print("ERROR: Max positions reached: ", MaxPositions);
+        double pip = SymbolPip(cmd.symbol);
+        double ask = SymbolInfoDouble(cmd.symbol, SYMBOL_ASK);
+        double bid = SymbolInfoDouble(cmd.symbol, SYMBOL_BID);
+        if(pip > 0 && ask > 0 && bid > 0)
+        {
+            double spreadPips = (ask - bid) / pip;
+            if(spreadPips > MaxSpreadPips)
+            {
+                Print("ERROR: Spread ", DoubleToString(spreadPips, 1), " pips exceeds MaxSpreadPips (", MaxSpreadPips, ")");
+                return false;
+            }
+        }
+    }
+
+    // Combined cap: our open positions AND pending orders both count, so a
+    // burst of pending split orders can't blow past the limit unnoticed.
+    if(CountOpenPositions() + CountPendingOrders() >= MaxPositions)
+    {
+        Print("ERROR: Max positions+orders reached: ", MaxPositions);
         return false;
     }
 
@@ -709,6 +768,7 @@ ulong ExecuteOrder(TradeCommand &cmd, string &errorMsg)
     DrawTPLevels(groupId, cmd.symbol, entryN, orderGroups[groupIndex].tp_prices, volumes, cmd.tp_count);
 
     Print("[OK] Order group placed: ", successCount, "/", cmd.tp_count, " orders successful");
+    g_groupsDirty = true;  // persist the new group on the next timer flush
     return firstTicket;  // Return first ticket as reference
 }
 
@@ -879,6 +939,7 @@ void CheckTP2ForTrailingSL()
 
             // Mark as TP2 reached
             orderGroups[i].tp2_reached = true;
+            g_groupsDirty = true;
 
             // Update visual
             UpdateTPLevelClosed(orderGroups[i].groupId, 2);
@@ -904,6 +965,7 @@ void CheckTP2ForTrailingSL()
             Print("[END] All orders/positions closed for group ", orderGroups[i].groupId);
             RemoveTPObjects(orderGroups[i].groupId);
             ArrayRemove(orderGroups, i, 1);
+            g_groupsDirty = true;
         }
     }
 }
@@ -925,12 +987,29 @@ int CountOpenPositions()
 }
 
 //+------------------------------------------------------------------+
+//| Count this EA's pending orders                                    |
+//+------------------------------------------------------------------+
+int CountPendingOrders()
+{
+    int count = 0;
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(ticket > 0 && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
 //| Check daily loss                                                   |
 //+------------------------------------------------------------------+
 bool CheckDailyLossLimit()
 {
-    // Reset the daily baseline when a new calendar day starts.
-    datetime today = TimeCurrent() - (TimeCurrent() % 86400);
+    // Reset the daily baseline when a new broker trading day starts.
+    datetime today = BrokerDayStart();
     if(today != dailyStartDay)
     {
         dailyStartDay = today;
@@ -1020,6 +1099,113 @@ int FindOrCreateGroup(string groupId)
 }
 
 //+------------------------------------------------------------------+
+//| Per-EA state file name (magic + account keep instances separate). |
+//+------------------------------------------------------------------+
+string GroupStateFile()
+{
+    return StringFormat("split_groups_%d_%I64d.csv", MagicNumber, account.Login());
+}
+
+//+------------------------------------------------------------------+
+//| Persist all tracked groups to disk. Called (via g_groupsDirty)    |
+//| whenever the group set changes, so a restart can rebuild tracking |
+//| even if the broker rewrote order comments.                        |
+//+------------------------------------------------------------------+
+void SaveGroups()
+{
+    int h = FileOpen(GroupStateFile(), FILE_WRITE|FILE_TXT|FILE_ANSI);
+    if(h == INVALID_HANDLE)
+    {
+        Print("[WARN] Could not write group state file: ", GetLastError());
+        return;
+    }
+    int n = ArraySize(orderGroups);
+    for(int i = 0; i < n; i++)
+    {
+        string tickets = "";
+        string prices = "";
+        for(int t = 0; t < MAX_SPLITS; t++)
+        {
+            if(t > 0) { tickets += ","; prices += ","; }
+            tickets += StringFormat("%I64u", orderGroups[i].tickets[t]);
+            prices  += StringFormat("%.8f", orderGroups[i].tp_prices[t]);
+        }
+        // groupId|count|tp2|entry|symbol|order_type|tickets|tp_prices
+        FileWrite(h, StringFormat("%s|%d|%d|%.8f|%s|%d|%s|%s",
+            orderGroups[i].groupId, orderGroups[i].count,
+            orderGroups[i].tp2_reached ? 1 : 0, orderGroups[i].entry_price,
+            orderGroups[i].symbol, (int)orderGroups[i].order_type, tickets, prices));
+    }
+    FileClose(h);
+}
+
+//+------------------------------------------------------------------+
+//| Load groups from disk. Returns true only if at least one valid    |
+//| group was loaded; an empty/malformed file falls back to comments. |
+//+------------------------------------------------------------------+
+bool LoadGroups()
+{
+    if(!FileIsExist(GroupStateFile())) return false;
+    int h = FileOpen(GroupStateFile(), FILE_READ|FILE_TXT|FILE_ANSI);
+    if(h == INVALID_HANDLE) return false;
+
+    while(!FileIsEnding(h))
+    {
+        string line = FileReadString(h);
+        if(StringLen(line) < 5) continue;
+
+        string f[];
+        if(StringSplit(line, '|', f) != 8) continue;  // skip malformed lines
+
+        int gi = ArraySize(orderGroups);
+        ArrayResize(orderGroups, gi + 1);
+        orderGroups[gi].groupId     = f[0];
+        orderGroups[gi].count       = (int)StringToInteger(f[1]);
+        orderGroups[gi].tp2_reached = (StringToInteger(f[2]) != 0);
+        orderGroups[gi].entry_price = StringToDouble(f[3]);
+        orderGroups[gi].symbol      = f[4];
+        orderGroups[gi].order_type  = (ENUM_ORDER_TYPE)StringToInteger(f[5]);
+
+        string ts[]; StringSplit(f[6], ',', ts);
+        string ps[]; StringSplit(f[7], ',', ps);
+        for(int t = 0; t < MAX_SPLITS; t++)
+        {
+            orderGroups[gi].tickets[t]   = (t < ArraySize(ts)) ? (ulong)StringToInteger(ts[t]) : 0;
+            orderGroups[gi].tp_prices[t] = (t < ArraySize(ps)) ? StringToDouble(ps[t]) : 0;
+        }
+        if(orderGroups[gi].count < 1 || orderGroups[gi].count > MAX_SPLITS)
+            orderGroups[gi].count = MAX_SPLITS;
+    }
+    FileClose(h);
+    return (ArraySize(orderGroups) > 0);
+}
+
+//+------------------------------------------------------------------+
+//| Redraw a recovered group's chart objects and gray out closed TPs. |
+//+------------------------------------------------------------------+
+void RedrawRecoveredGroup(int g)
+{
+    if(orderGroups[g].entry_price <= 0) return;
+
+    double vols[MAX_SPLITS];
+    for(int t = 0; t < MAX_SPLITS; t++)
+    {
+        vols[t] = 0;
+        ulong tk = orderGroups[g].tickets[t];
+        if(tk == 0) continue;
+        if(PositionSelectByTicket(tk))   vols[t] = PositionGetDouble(POSITION_VOLUME);
+        else if(OrderSelect(tk))         vols[t] = OrderGetDouble(ORDER_VOLUME_CURRENT);
+    }
+
+    DrawTPLevels(orderGroups[g].groupId, orderGroups[g].symbol,
+                 orderGroups[g].entry_price, orderGroups[g].tp_prices, vols, orderGroups[g].count);
+
+    for(int t = 0; t < orderGroups[g].count; t++)
+        if(orderGroups[g].tickets[t] == 0)
+            UpdateTPLevelClosed(orderGroups[g].groupId, t + 1);
+}
+
+//+------------------------------------------------------------------+
 //| Recover split orders on EA restart                                |
 //+------------------------------------------------------------------+
 void RecoverSplitOrders()
@@ -1028,6 +1214,47 @@ void RecoverSplitOrders()
 
     ArrayResize(orderGroups, 0);  // Clear array first
 
+    // Prefer the state file (authoritative: knows real count, tp2_reached, and
+    // exact TP prices even if the broker rewrote order comments). Reconcile it
+    // against live orders/positions and drop anything that no longer exists.
+    if(LoadGroups())
+    {
+        for(int g = ArraySize(orderGroups) - 1; g >= 0; g--)
+        {
+            bool anyAlive = false;
+            for(int t = 0; t < MAX_SPLITS; t++)
+            {
+                ulong tk = orderGroups[g].tickets[t];
+                if(tk == 0) continue;
+                if(OrderSelect(tk) || PositionSelectByTicket(tk)) anyAlive = true;
+                else orderGroups[g].tickets[t] = 0;  // stale ticket - drop it
+            }
+
+            if(!anyAlive)
+            {
+                RemoveTPObjects(orderGroups[g].groupId);
+                ArrayRemove(orderGroups, g, 1);
+                continue;
+            }
+
+            // TP2 closed while we were offline: mark reached (as the comment
+            // path does) so trailing state stays consistent.
+            bool laterAlive = false;
+            for(int t = 2; t < MAX_SPLITS; t++)
+                if(orderGroups[g].tickets[t] > 0) { laterAlive = true; break; }
+            if(orderGroups[g].tickets[1] == 0 && laterAlive)
+                orderGroups[g].tp2_reached = true;
+
+            RedrawRecoveredGroup(g);
+        }
+
+        Print("==== Recovered ", ArraySize(orderGroups), " group(s) from state file ====");
+        SaveGroups();  // rewrite the reconciled state
+        return;
+    }
+
+    // No state file (fresh install or first run after upgrade): fall back to
+    // rebuilding from order comments, then seed the state file.
     Print("Total open positions found: ", PositionsTotal());
     Print("Total pending orders found: ", OrdersTotal());
 
@@ -1100,29 +1327,13 @@ void RecoverSplitOrders()
 
         if(orderGroups[g].entry_price > 0)
         {
-            // Read back the actual live volume of each surviving split so the
-            // chart labels are correct after recovery.
-            double vols[MAX_SPLITS];
-            for(int t = 0; t < MAX_SPLITS; t++)
-            {
-                vols[t] = 0;
-                ulong tk = orderGroups[g].tickets[t];
-                if(tk == 0) continue;
-                if(PositionSelectByTicket(tk))      vols[t] = PositionGetDouble(POSITION_VOLUME);
-                else if(OrderSelect(tk))            vols[t] = OrderGetDouble(ORDER_VOLUME_CURRENT);
-            }
-
-            DrawTPLevels(orderGroups[g].groupId, orderGroups[g].symbol,
-                         orderGroups[g].entry_price, orderGroups[g].tp_prices, vols, orderGroups[g].count);
-
-            // Mark already-closed TPs as gray.
-            for(int t = 0; t < orderGroups[g].count; t++)
-                if(orderGroups[g].tickets[t] == 0)
-                    UpdateTPLevelClosed(orderGroups[g].groupId, t + 1);
-
+            RedrawRecoveredGroup(g);
             Print("[OK] Group ", orderGroups[g].groupId, " recovered successfully");
         }
     }
+
+    // Seed the state file from comment-based recovery so future restarts use it.
+    SaveGroups();
 
     Print("");
     Print("==== Split Order Recovery Complete ====");
@@ -1289,6 +1500,7 @@ string HandleClosePosition(string commandJson)
                     {
                         RemoveTPObjects(groupId);
                         ArrayRemove(orderGroups, i, 1);
+                        g_groupsDirty = true;
                     }
                     break;
                 }

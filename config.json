@@ -18,9 +18,8 @@
     "min_lot_per_trade": 0.01
   },
   "take_profit": {
-    "levels": 5,
-    "pip_step": 30,
-    "partial_close_percent": 20.0
+    "default_levels": 5,
+    "pip_step": 30
   },
   "server": {
     "port": 8080,
