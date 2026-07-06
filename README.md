@@ -38,7 +38,7 @@ System: Splits order → Manages positions → Returns status
 - ✅ **MCP Server** - Native Model Context Protocol server so Claude Code / Claude Desktop can inspect and control MT5 directly
 - ✅ **TCP Socket Communication** - High-performance bidirectional communication
 - ✅ **Order Type Safety** - Validates STOP/LIMIT (and SL/TP sides) against the live market and **rejects** wrong-side orders instead of silently reinterpreting your intent
-- ✅ **Position Recovery** - Rebuilds tracking from existing orders on restart
+- ✅ **Position Recovery** - Persists group state to disk and rebuilds tracking on restart, reconciling against live orders (survives broker comment rewrites)
 - ✅ **Any-Symbol Support** - Works on any MT5 symbol; volumes snap to the broker's lot step and prices normalize to the symbol's digits (Gold/XAUUSD and Silver/XAGUSD are examples, not limits)
 - ✅ **Risk Management** - Daily loss limits, max positions, spread checks
 - ✅ **AI Agent Ready** - Perfect for Claude AI, ChatGPT, and automation workflows
@@ -632,8 +632,9 @@ Configure in MT5 when attaching EA to chart:
 | `ServerPort` | 5555 | TCP server port |
 | `MagicNumber` | 20250117 | Unique identifier for EA orders |
 | `SocketCheckIntervalMs` | 500 | How often to check for commands (ms) |
-| `MaxSpreadPips` | 10 | Maximum allowed spread in pips |
-| `MaxDailyLossPercent` | 5.0 | Stop trading if daily loss exceeds % |
+| `MaxSpreadPips` | 10 | Reject new orders when the live spread exceeds this (0 disables). 1 pip = 10 points on 5/3-digit symbols, 1 point otherwise — metals/indices may need a higher value. |
+| `MaxPositions` | 50 | Cap on this EA's **open positions + pending orders combined** |
+| `MaxDailyLossPercent` | 5.0 | Stop trading if the loss since **broker midnight** exceeds % (measured against equity) |
 
 ### 🔒 Security
 
@@ -803,14 +804,14 @@ python server.py
 **Symptoms:** TP2 closes but SL doesn't move to TP1
 
 **Possible Causes:**
-1. EA was restarted after orders placed (group tracking lost)
-2. Orders placed manually instead of through API
-3. Comment format doesn't match expected pattern
+1. Orders placed manually instead of through the API (no tracked group)
+2. TP2's volume was set to `0` in a custom `volume_split` (no TP2 order exists to trigger the move)
+3. The group only has one or two levels (nothing beyond TP2 to trail)
 
 **Solution:**
-- Always place orders through the API
-- Don't restart EA while positions are open
-- Check order comments include GROUP and TP fields
+- Always place orders through the API so a group is tracked
+- Keep a non-zero TP2 weight if you rely on the trailing trigger
+- Group state now survives restarts (persisted to `MQL5/Files/`), so a restart no longer loses tracking
 
 ### Safe Shutdown Not Working
 
@@ -831,7 +832,7 @@ python server.py
 A: Yes. You send absolute TP/SL/entry prices, and the EA reads each symbol's volume step, minimum lot, and digit precision directly from MT5, so any broker symbol works (FX pairs, metals, indices, crypto CFDs). XAUUSD/XAGUSD are just the examples this project started with.
 
 **Q: What happens if I restart MT5 while positions are open?**
-A: The EA has position recovery logic that rebuilds order group tracking from position comments. However, trailing SL won't trigger during the restart period.
+A: The EA persists each group's state (levels, TP prices, trailing status) to a per-account file in `MQL5/Files/` and reloads it on startup, reconciling against your live orders and positions. This survives even if your broker rewrites order comments. Trailing SL still won't *fire* during the moments the EA is actually offline, but tracking is restored intact once it restarts.
 
 **Q: Can I change the volume distribution (60/10/10/10/10)?**
 A: Yes — send a `volume_split` array in the API request (see [Split Order System](#-split-order-system)). No code editing required; the 60/40 default is only applied when you omit it. You can also use 1-10 levels instead of exactly 5.

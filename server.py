@@ -60,7 +60,6 @@ class OrderCommand(BaseModel):
     deviation: int = 3
     comment: str = "Claude AI"
     magic_number: int = 20250117
-    partial_close_percent: float = 20.0
 
     @field_validator("tp_levels")
     @classmethod
@@ -254,7 +253,6 @@ async def create_order(order: OrderCommand):
             "deviation": order.deviation,
             "comment": order.comment,
             "magic_number": order.magic_number,
-            "partial_close_percent": order.partial_close_percent,
         },
     }
     return send_command_to_mt5(command)
